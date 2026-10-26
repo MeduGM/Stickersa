@@ -29,6 +29,7 @@
   const EMOJI_RE = /<(a?):(\w+):(\d+)>/g;
   const patches = [];
   const timers = [];
+  const unsubs = [];
   const S = {}; // stores y modulos de Discord (se llenan en onLoad)
   const state = {
     report: { patched: [], missing: [], similar: [] },
@@ -772,7 +773,7 @@
   function buildCatalogRaw() {
     const guilds = safe("guilds", () => S.GuildStore?.getGuilds?.()) ?? {};
     const gname = (gid) => guilds[gid]?.name ?? "Servidor";
-    const stickers = [], emojis = [];
+    const stickers = [], emojis = [], guildStickers = [];
 
     safe("stickers", () => {
       const map = S.StickersStore?.getAllGuildStickers?.();
@@ -781,7 +782,9 @@
         for (const [gid, arr] of entries)
           for (const s of arr ?? []) {
             if (fmt(s) === 3) continue; // Lottie no se puede mandar como imagen
-            stickers.push({ kind: "sticker", key: "sticker:" + s.id, id: s.id, name: s.name ?? "", n: norm(s.name), group: gname(gid), raw: s, tag: fmt(s) === 4 ? "GIF" : fmt(s) === 2 ? "APNG" : "" });
+            const it = { kind: "sticker", key: "sticker:" + s.id, id: s.id, name: s.name ?? "", n: norm(s.name), group: gname(gid), raw: s, tag: fmt(s) === 4 ? "GIF" : fmt(s) === 2 ? "APNG" : "" };
+            stickers.push(it);
+            guildStickers.push(it);
           }
       }
       for (const pack of S.StickersStore?.getPremiumPacks?.() ?? [])
@@ -797,17 +800,63 @@
           emojis.push({ kind: "emoji", key: "emoji:" + e.id, id: e.id, name: e.name ?? "", n: norm(e.name), animated: !!e.animated, group: gname(gid) });
     });
 
+    // La tienda de stickers de Discord a veces tarda en llenarse (al abrir la app o al volver de segundo plano).
+    // Mientras no haya stickers de servidores, se usa la copia guardada de la ultima vez que si cargaron
+    // (mandarlos solo necesita el id y el formato). Cuando llegan los reales, los reemplazan.
+    const live = guildStickers.length > 0;
+    let fromCache = false;
+    if (live) scheduleStickerSave(guildStickers);
+    else {
+      const have = new Set(stickers.map((i) => i.id));
+      for (const r of getList("stickerCache")) { // [id, nombre, formato, servidor]
+        if (!Array.isArray(r) || !r[0] || have.has(r[0]) || (r[2] !== 1 && r[2] !== 2 && r[2] !== 4)) continue;
+        stickers.push({ kind: "sticker", key: "sticker:" + r[0], id: r[0], name: r[1] ?? "", n: norm(r[1]), group: r[3] ?? "Servidor", raw: { id: r[0], name: r[1], format_type: r[2] }, tag: r[2] === 4 ? "GIF" : r[2] === 2 ? "APNG" : "" });
+        fromCache = true;
+      }
+    }
+
     const uniq = (list) => [...new Set(list.map((i) => i.group))].sort((a, b) => a.localeCompare(b));
     const byKey = {};
     for (const i of stickers) byKey[i.key] = i;
     for (const i of emojis) byKey[i.key] = i;
-    return { stickers, emojis, byKey, stickerGroups: uniq(stickers), emojiGroups: uniq(emojis) };
+    return { stickers, emojis, byKey, stickerGroups: uniq(stickers), emojiGroups: uniq(emojis), live, fromCache };
   }
-  // El catalogo se arma una vez y se reutiliza 30 s (abrir el selector es instantaneo)
+
+  // Copia guardada de los stickers de tus servidores. Se guarda 8 s despues del ultimo cambio (asi no se
+  // sobrescribe con una lista a medio cargar si la app se cierra justo al abrir) y solo si cambio algo.
+  let saveT = null, saveRows = null;
+  function flushStickerSave() {
+    if (saveT) { clearTimeout(saveT); saveT = null; }
+    if (saveRows) { setList("stickerCache", saveRows); saveRows = null; }
+  }
+  function scheduleStickerSave(list) {
+    const rows = list.map((i) => [i.id, i.name, fmt(i.raw), i.group]);
+    if (JSON.stringify(rows) === JSON.stringify(getList("stickerCache"))) { saveRows = null; if (saveT) { clearTimeout(saveT); saveT = null; } return; }
+    saveRows = rows;
+    if (saveT) clearTimeout(saveT);
+    saveT = setTimeout(flushStickerSave, 8000);
+  }
+
+  // El catalogo se reutiliza 30 s (abrir el selector es instantaneo), pero SOLO si ya tiene los stickers
+  // reales: uno vacio o sacado de la copia guardada se vuelve a armar a los 2 s, y cualquier cambio en la
+  // tienda de stickers lo invalida al momento (antes un catalogo vacio se quedaba 30 s).
   let catCache = null, catAt = 0;
   function getCatalog(force) {
-    if (force === true || !catCache || Date.now() - catAt > 30000) { catCache = buildCatalogRaw(); catAt = Date.now(); }
+    const ttl = catCache && catCache.live ? 30000 : 2000;
+    if (force === true || !catCache || Date.now() - catAt > ttl) { catCache = buildCatalogRaw(); catAt = Date.now(); }
     return catCache;
+  }
+  // El selector abierto se entera cuando los stickers terminan de cargar y se actualiza solo
+  const catListeners = new Set();
+  let notifyT = null;
+  function onStickersChanged() {
+    catAt = 0;
+    if (notifyT) return;
+    notifyT = setTimeout(() => {
+      notifyT = null;
+      safe("catalogo", () => getCatalog()); // arma el catalogo (y la copia guardada) aunque el selector este cerrado
+      for (const f of [...catListeners]) safe("catalogo listener", f);
+    }, 400);
   }
 
   // Cierre del selector: la hoja se cierra por su clave (igual que Bunny). Si el selector se pudo envolver
@@ -875,7 +924,17 @@
     const [, bump] = React.useReducer((x) => x + 1, 0);
     const [closed, setClosed] = React.useState(false);
     const [full, setFull] = React.useState(false);
-    const cat = React.useMemo(getCatalog, []);
+    const [ver, setVer] = React.useState(0);
+    const [openedAt] = React.useState(Date.now);
+    const cat = React.useMemo(() => getCatalog(), [ver]);
+    React.useEffect(() => {
+      // Mientras los stickers reales no hayan llegado, vuelve a mirar cada 2 s (hasta 2 min);
+      // ademas se actualiza al instante cuando la tienda de stickers cambia
+      const f = () => setVer((v) => v + 1);
+      catListeners.add(f);
+      const t = setInterval(() => { if (!getCatalog().live && Date.now() - openedAt < 120000) f(); }, 2000);
+      return () => { catListeners.delete(f); clearInterval(t); };
+    }, []);
     React.useEffect(() => {
       const f = () => setClosed(true);
       softClosers.add(f);
@@ -927,7 +986,7 @@
     const HScroll = mode !== "rn" && S.GHScroll ? S.GHScroll : RN.ScrollView;
     const emptyMsg = group === "@favs" ? "Mant\u00e9n presionado un sticker o emoji para guardarlo aqu\u00ed"
       : group === "@recents" ? "Aqu\u00ed aparecer\u00e1n los que uses"
-      : items.length ? (anim === "anim" ? "No hay animados aqu\u00ed" : anim === "static" ? "No hay no animados aqu\u00ed" : "Sin resultados") : "No se encontraron " + (isSticker ? "stickers" : "emojis") + " en tus servidores";
+      : items.length ? (anim === "anim" ? "No hay animados aqu\u00ed" : anim === "static" ? "No hay no animados aqu\u00ed" : "Sin resultados") : isSticker && !cat.live && Date.now() - openedAt < 120000 ? "Cargando stickers..." : "No se encontraron " + (isSticker ? "stickers" : "emojis") + " en tus servidores";
     const listNode = !shown.length
       ? h(RN.Text, { style: { color: "#b5bac1", textAlign: "center", marginTop: 24 } }, emptyMsg)
       : mode === "sheet"
@@ -1102,7 +1161,7 @@
       "ultimo APNG->GIF: " + (gifState.last || "ninguno") + " | ok: " + gifState.ok + " | fallos: " + gifState.fail + "\n" +
       "ultimo contenido enviado: " + (state.spy.lastUrl || "ninguno") + "\n" +
       "funciones con 'sticker': " + ([...stickerFns].join(", ") || "ninguna") + "\n" +
-      "catalogo: " + (safe("cat", () => { const c = getCatalog(true); return c.stickers.length + " stickers, " + c.emojis.length + " emojis"; }) ?? "error")
+      "catalogo: " + (safe("cat", () => { const c = getCatalog(true); return c.stickers.length + " stickers" + (c.live ? "" : c.fromCache ? " (de la copia guardada: la tienda de stickers esta vacia)" : " (la tienda de stickers esta vacia y no hay copia)") + ", " + c.emojis.length + " emojis | copia guardada: " + getList("stickerCache").length; }) ?? "error")
     );
   }
   function copyReport() {
@@ -1201,6 +1260,17 @@
       S.SelectedChannelStore = findByStoreName("SelectedChannelStore");
       S.PendingReplyStore = findByStoreName("PendingReplyStore");
       S.FluxDispatcher = safe("flux", () => vendetta.metro.common.FluxDispatcher);
+
+      // Catalogo de stickers: se renueva cuando la tienda cambia y se arma al poco de iniciar,
+      // para que la copia guardada exista aunque nunca abras el selector
+      safe("tienda stickers", () => {
+        const st = S.StickersStore;
+        if (st?.addChangeListener) {
+          st.addChangeListener(onStickersChanged);
+          unsubs.push(() => st.removeChangeListener?.(onStickersChanged));
+        }
+        timers.push(setTimeout(() => safe("precarga", () => getCatalog()), 4000));
+      });
 
       // 0) Comandos: /sticker [nombre] y /emoji
       safe("comandos", () => {
@@ -1321,8 +1391,12 @@
     },
 
     onUnload() {
-      for (const t of timers) clearInterval(t);
+      for (const t of timers) { clearInterval(t); clearTimeout(t); }
       timers.length = 0;
+      for (const u of unsubs) safe("quitar listener", u);
+      unsubs.length = 0;
+      if (notifyT) { clearTimeout(notifyT); notifyT = null; }
+      safe("guardar copia", flushStickerSave);
       for (const unpatch of patches) safe("unpatch", unpatch);
       patches.length = 0;
     },
