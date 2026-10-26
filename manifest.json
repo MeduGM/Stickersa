@@ -1,0 +1,14 @@
+{
+  "name": "StickerSender",
+  "description": "Manda stickers y emojis bloqueados como imagen, con tamaño normal (sticker 160px, emoji 48px). Con ajustes.",
+  "authors": [
+    {
+      "name": "Tu nombre"
+    }
+  ],
+  "main": "index.js",
+  "hash": "165f83ec3143fa4920cc065dc29c5e9e3b3b74bff8a27d3d1f97e6221b73764d",
+  "vendetta": {
+    "icon": "ic_image"
+  }
+}
