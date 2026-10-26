@@ -11,6 +11,7 @@
     maskEmojiLinks: true,   // emoji dentro de texto: [nombre](url) en vez del link crudo
     animatedStickers: true, // false = manda siempre PNG estatico
     apngFormat: "png",      // como mandar stickers APNG animados: png | webp | gif (experimental)
+    nativeSheet: true,      // selector dentro del ActionSheet nativo (cierra bien). Apagar = modo de respaldo
     keepOpen: false,        // dejar el selector abierto despues de mandar (para mandar varios)
     nativeUnlock: true,     // intentar desbloquear los selectores nativos de Discord
     debugReport: false,     // copiar reporte al portapapeles en cada inicio
@@ -62,11 +63,12 @@
     const sz = size("stickerSize");
     const type = fmt(s);
     if (type === 3) return null; // Lottie: no existe como imagen
-    if (type === 4 && cfg("animatedStickers")) return base + ".gif?size=" + sz;
+    // Igual que el cliente oficial: los animados llevan passthrough=true; sin eso el proxy manda un solo cuadro
+    if (type === 4 && cfg("animatedStickers")) return base + ".gif?size=" + sz + "&passthrough=true";
     if (type === 2 && cfg("animatedStickers")) {
       const f = cfg("apngFormat");
-      if (f === "webp") return base + ".webp?size=" + sz + "&animated=true&quality=lossless";
-      if (f === "gif") return base + ".gif?size=" + sz;
+      if (f === "webp") return base + ".webp?size=" + sz + "&animated=true&passthrough=true";
+      if (f === "gif") return base + ".gif?size=" + sz + "&passthrough=true";
       return base + ".png?size=" + sz + "&passthrough=true";
     }
     return base + ".png?size=" + sz + "&passthrough=false";
@@ -199,11 +201,14 @@
     return catCache;
   }
 
-  // Cierre del selector: se prueban varias formas, y si la hoja no se cierra, el propio contenido se oculta
+  // Cierre del selector: la hoja se cierra por su clave (igual que Bunny). Si el selector se pudo envolver
+  // en el ActionSheet nativo, cierra de verdad (tocar fuera, deslizar, boton atras). El cierre "suave"
+  // (ocultar contenido) solo se usa si NO hay ActionSheet nativo, y nunca si se cerro bien.
   const SHEET_KEY = "StickerSenderPicker";
   const softClosers = new Set();
   function closePicker() {
     safe("close key", () => S.ActionSheet?.hideActionSheet?.(SHEET_KEY));
+    if (S.NativeSheet) return; // hoja nativa: hideActionSheet(clave) basta
     safe("close", () => S.ActionSheet?.hideActionSheet?.());
     for (const f of [...softClosers]) safe("soft close", f);
   }
@@ -288,58 +293,77 @@
     const boxH = Math.round(RN.Dimensions.get("window").height * 0.6);
     const statusPad = (RN.StatusBar?.currentHeight ?? 28) + 8;
 
-    // Contenedor: si la hoja de Discord ocupa toda la pantalla, el selector queda abajo y tocar
-    // arriba lo cierra. Si la hoja solo mide lo que mide el selector, queda arriba (con margen).
+    // Contenido del selector (igual para ambos modos)
+    const kids = [
+        h(RN.View, { style: { flexDirection: "row", marginBottom: 8 } },
+          chip("Stickers", isSticker, () => { setTab("sticker"); setGroup("*"); }, "t1"),
+          chip("Emojis", !isSticker, () => { setTab("emoji"); setGroup("*"); }, "t2"),
+          h(RN.View, { style: { flex: 1 } }),
+          chip("Cerrar", false, closePicker, "close")),
+        h(RN.TextInput, {
+          value: query, onChangeText: setQuery, placeholder: "Buscar...", placeholderTextColor: "#80848e",
+          style: { backgroundColor: "#2b2d31", color: "#fff", borderRadius: 8, paddingHorizontal: 12, height: 40, marginBottom: 8 },
+        }),
+        h(RN.ScrollView, { horizontal: true, showsHorizontalScrollIndicator: false, style: { flexGrow: 0, marginBottom: 8 } },
+          chip("Todos", group === "*", () => setGroup("*"), "*"),
+          chip("\u2605 Favoritos", group === "@favs", () => setGroup("@favs"), "@favs"),
+          chip("Recientes", group === "@recents", () => setGroup("@recents"), "@recents"),
+          ...groups.map((g) => chip(g, group === g, () => setGroup(g), g))),
+        shown.length
+          ? h(RN.FlatList, {
+              data: shown, numColumns: 4, keyExtractor: (i) => i.kind + i.id,
+              initialNumToRender: 24, windowSize: 5, removeClippedSubviews: true,
+              keyboardShouldPersistTaps: "handled", nestedScrollEnabled: true, style: { flex: 1 },
+              renderItem: ({ item }) =>
+                h(RN.Pressable, {
+                  onPress: () => pickItem(item, props.channelId),
+                  onLongPress: () => { toast(toggleFav(item.key) ? "Agregado a favoritos" : "Quitado de favoritos"); bump(); },
+                  style: { width: "25%", alignItems: "center", padding: 4 },
+                },
+                  h(RN.Image, { source: { uri: previewUrl(item) }, style: { width: 64, height: 64 }, resizeMode: "contain" }),
+                  h(RN.Text, { numberOfLines: 1, style: { color: "#b5bac1", fontSize: 10, marginTop: 2 } }, (favSet.has(item.key) ? "\u2605 " : "") + item.name),
+                  item.tag ? h(RN.Text, { style: { color: "#5865f2", fontSize: 9, fontWeight: "bold" } }, item.tag) : null),
+            })
+          : h(RN.Text, { style: { color: "#b5bac1", textAlign: "center", marginTop: 24 } },
+              group === "@favs" ? "Mant\u00e9n presionado un sticker o emoji para guardarlo aqu\u00ed"
+                : group === "@recents" ? "Aqu\u00ed aparecer\u00e1n los que uses"
+                : items.length ? "Sin resultados" : "No se encontraron " + (isSticker ? "stickers" : "emojis") + " en tus servidores")
+    ];
+
+    // Modo nativo: dentro del ActionSheet de Discord. Ahi la hoja se ancla abajo, se cierra de verdad
+    // (hideActionSheet(clave), tocar fuera, deslizar, atras) y no deja nada tapando la pantalla.
+    const NS = S.NativeSheet;
+    if (NS)
+      return h(NS, null,
+        h(RN.View, { style: { height: boxH, paddingBottom: 16 } }, ...kids));
+
+    // Modo de respaldo (sin ActionSheet nativo): contenedor propio. Si la hoja de Discord ocupa toda la
+    // pantalla, el selector queda abajo y tocar arriba lo cierra.
     return h(RN.View, {
       style: { flex: 1, justifyContent: "flex-end" },
       onLayout: (e) => { const hh = e?.nativeEvent?.layout?.height ?? 0; setFull(hh > boxH + 40); },
     },
       h(RN.Pressable, { style: { flex: 1 }, onPress: closePicker }),
       h(RN.View, {
-      style: {
-        height: boxH,
-        backgroundColor: "#1e1f22",
-        borderTopLeftRadius: 16, borderTopRightRadius: 16,
-        paddingTop: full ? 12 : statusPad, paddingHorizontal: 12, paddingBottom: 24,
-      },
-    },
-      h(RN.View, { style: { flexDirection: "row", marginBottom: 8 } },
-        chip("Stickers", isSticker, () => { setTab("sticker"); setGroup("*"); }, "t1"),
-        chip("Emojis", !isSticker, () => { setTab("emoji"); setGroup("*"); }, "t2"),
-        h(RN.View, { style: { flex: 1 } }),
-        chip("Cerrar", false, closePicker, "close")),
-      h(RN.TextInput, {
-        value: query, onChangeText: setQuery, placeholder: "Buscar...", placeholderTextColor: "#80848e",
-        style: { backgroundColor: "#2b2d31", color: "#fff", borderRadius: 8, paddingHorizontal: 12, height: 40, marginBottom: 8 },
-      }),
-      h(RN.ScrollView, { horizontal: true, showsHorizontalScrollIndicator: false, style: { flexGrow: 0, marginBottom: 8 } },
-        chip("Todos", group === "*", () => setGroup("*"), "*"),
-        chip("\u2605 Favoritos", group === "@favs", () => setGroup("@favs"), "@favs"),
-        chip("Recientes", group === "@recents", () => setGroup("@recents"), "@recents"),
-        ...groups.map((g) => chip(g, group === g, () => setGroup(g), g))),
-      shown.length
-        ? h(RN.FlatList, {
-            data: shown, numColumns: 4, keyExtractor: (i) => i.kind + i.id,
-            initialNumToRender: 24, windowSize: 5, removeClippedSubviews: true,
-            keyboardShouldPersistTaps: "handled", nestedScrollEnabled: true, style: { flex: 1 },
-            renderItem: ({ item }) =>
-              h(RN.Pressable, {
-                onPress: () => pickItem(item, props.channelId),
-                onLongPress: () => { toast(toggleFav(item.key) ? "Agregado a favoritos" : "Quitado de favoritos"); bump(); },
-                style: { width: "25%", alignItems: "center", padding: 4 },
-              },
-                h(RN.Image, { source: { uri: previewUrl(item) }, style: { width: 64, height: 64 }, resizeMode: "contain" }),
-                h(RN.Text, { numberOfLines: 1, style: { color: "#b5bac1", fontSize: 10, marginTop: 2 } }, (favSet.has(item.key) ? "\u2605 " : "") + item.name),
-                item.tag ? h(RN.Text, { style: { color: "#5865f2", fontSize: 9, fontWeight: "bold" } }, item.tag) : null),
-          })
-        : h(RN.Text, { style: { color: "#b5bac1", textAlign: "center", marginTop: 24 } },
-            group === "@favs" ? "Mant\u00e9n presionado un sticker o emoji para guardarlo aqu\u00ed"
-              : group === "@recents" ? "Aqu\u00ed aparecer\u00e1n los que uses"
-              : items.length ? "Sin resultados" : "No se encontraron " + (isSticker ? "stickers" : "emojis") + " en tus servidores")));
+        style: {
+          height: boxH,
+          backgroundColor: "#1e1f22",
+          borderTopLeftRadius: 16, borderTopRightRadius: 16,
+          paddingTop: full ? 12 : statusPad, paddingHorizontal: 12, paddingBottom: 24,
+        },
+      }, ...kids));
+  }
+
+  function resolveNativeSheet() {
+    S.NativeSheet = null;
+    if (!cfg("nativeSheet")) return;
+    const c = safe("nativeSheet", () => findByProps("ActionSheet")?.ActionSheet);
+    if (c && (typeof c === "function" || (typeof c === "object" && c.$$typeof))) S.NativeSheet = c;
   }
 
   function openPicker(opts) {
     const { React } = vendetta.metro.common;
+    resolveNativeSheet();
     const channelId = opts.channelId ?? S.SelectedChannelStore?.getChannelId?.();
     const comp = () => React.createElement(Picker, { ...opts, channelId });
     if (S.ActionSheet?.openLazy)
@@ -423,14 +447,14 @@
   function reportText() {
     const r = state.report;
     return (
-      "StickerSender v2.4\n" +
+      "StickerSender v2.5\n" +
       "parcheados: " + (r.patched.join(", ") || "ninguno") + "\n" +
       "no encontrados: " + (r.missing.join(", ") || "ninguno") + "\n" +
       "nombres parecidos: " + (r.similar.slice(0, 60).join(", ") || "ninguno") + "\n" +
       "enum SENDABLE: " + !!enumObj + " | modulos revisados: " + scanned.size + "\n" +
       "sendMessage:" + !!S.MessageActions + " sendStickers:" + !!S.StickerActions +
       " StickersStore:" + !!S.StickersStore + " EmojiStore:" + !!S.EmojiStore +
-      " GuildStore:" + !!S.GuildStore + " ActionSheet:" + !!S.ActionSheet +
+      " GuildStore:" + !!S.GuildStore + " ActionSheet:" + !!S.ActionSheet + " hojaNativa:" + !!S.NativeSheet +
       " comandos:" + !!vendetta.commands?.registerCommand + "\n" +
       "sendMessage llamadas: " + state.spy.sendMessage + " | sendStickers llamadas: " + state.spy.sendStickers +
       " | stickers convertidos: " + state.spy.converted + "\n" +
@@ -482,6 +506,7 @@
           subLabel: "Actual: " + cfg("apngFormat") + " (toca para cambiar: png, webp, gif). Prueba cual se anima",
           onPress: () => set("apngFormat", { png: "webp", webp: "gif", gif: "png" }[cfg("apngFormat")] || "png"),
         }),
+        sw("nativeSheet", "Selector en hoja nativa", "Cierra bien. Apagar solo si el selector se ve mal"),
         sw("keepOpen", "Mantener selector abierto", "Para mandar varios seguidos"),
         sw("maskEmojiLinks", "Ocultar link de emoji", "Muestra [nombre] en vez del link"),
         sw("nativeUnlock", "Desbloquear selectores nativos", "Extra; requiere reiniciar el plugin"),
