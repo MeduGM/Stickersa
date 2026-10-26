@@ -10,7 +10,7 @@
     emojiSize: 48,          // tamaño de emoji grande
     maskEmojiLinks: true,   // emoji dentro de texto: [nombre](url) en vez del link crudo
     animatedStickers: true, // false = manda siempre PNG estatico
-    apngFormat: "png",      // como mandar stickers APNG animados: png | webp | gif (experimental)
+    apngFormat: "webp",     // como mandar stickers APNG animados: png | webp | gif (experimental)
     animatedPreview: true,  // el selector propio muestra los animados animados
     scrollMode: "gh",       // lista del selector: gh (gestos nativos) | rn (normal) | sheet (la hoja se desliza)
     nativeSheet: true,      // selector dentro del ActionSheet nativo (cierra bien). Apagar = modo de respaldo
@@ -60,7 +60,7 @@
 
   // ---------- URLs ----------
   // format_type: 1 PNG, 2 APNG, 3 Lottie, 4 GIF
-  function stickerUrl(s, szOverride) {
+  function stickerUrl(s, szOverride, preview) {
     const base = "https://media.discordapp.net/stickers/" + s.id;
     const sz = szOverride || size("stickerSize");
     const type = fmt(s);
@@ -68,8 +68,9 @@
     // Igual que el cliente oficial: los animados llevan passthrough=true; sin eso el proxy manda un solo cuadro
     if (type === 4 && cfg("animatedStickers")) return base + ".gif?size=" + sz + "&passthrough=true";
     if (type === 2 && cfg("animatedStickers")) {
-      const f = cfg("apngFormat");
-      if (f === "webp") return base + ".webp?size=" + sz + "&animated=true&passthrough=true";
+      const f = preview ? "png" : cfg("apngFormat");
+      // passthrough=false: el proxy convierte el APNG a WebP animado (con true devolvia el APNG original, que los embeds aplanan)
+      if (f === "webp") return base + ".webp?size=" + sz + "&animated=true&passthrough=false";
       if (f === "gif") return base + ".gif?size=" + sz + "&passthrough=true";
       return base + ".png?size=" + sz + "&passthrough=true";
     }
@@ -86,7 +87,7 @@
   const previewUrl = (it) => {
     if (it.kind === "sticker") {
       if (cfg("animatedPreview") && it.raw && fmt(it.raw) !== 3) {
-        const u = stickerUrl(it.raw, 96);
+        const u = stickerUrl(it.raw, 96, true);
         if (u) return u;
       }
       return "https://media.discordapp.net/stickers/" + it.id + ".png?size=96&passthrough=false";
