@@ -12,6 +12,7 @@
     animatedStickers: true, // false = manda siempre PNG estatico
     apngFormat: "png",      // como mandar stickers APNG animados: png | webp | gif (experimental)
     apngAsGif: true,        // APNG animados: convertirlos a GIF y subirlos como archivo (si falla, se manda el link)
+    gifPad: 2,              // ancho del lienzo del GIF / ancho del sticker (mas alto = sticker mas chico en el chat)
     animatedPreview: true,  // el selector propio muestra los animados animados
     scrollMode: "gh",       // lista del selector: gh (gestos nativos) | rn (normal) | sheet (la hoja se desliza)
     nativeSheet: true,      // selector dentro del ActionSheet nativo (cierra bien). Apagar = modo de respaldo
@@ -608,10 +609,29 @@
     return out;
   }
 
+  // Discord (movil) agranda los archivos chicos hasta llenar el ancho del chat, asi que un GIF de 160 px
+  // se ve enorme. Solucion: lienzo transparente mas ANCHO (no mas alto) con el sticker pegado a la izquierda.
+  // Discord agranda el lienzo al ancho del chat y el sticker queda con tamano normal, sin espacio vertical
+  // de sobra y alineado a la izquierda como un sticker de verdad. "gifPad" = ancho del lienzo / ancho del
+  // sticker (ajustable en Ajustes). 1 = sin margen.
+  const gifPad = () => { const n = Number(cfg("gifPad")); return n >= 1 && n <= 6 ? n : 2; };
+  function padFrames(anim, k) {
+    if (!(k > 1)) return anim;
+    const W = Math.round(anim.w * k), rowBytes = anim.w * 4;
+    for (const f of anim.frames) {
+      const out = new Uint8Array(W * anim.h * 4); // todo transparente
+      for (let y = 0; y < anim.h; y++)
+        out.set(f.rgba.subarray(y * rowBytes, (y + 1) * rowBytes), y * W * 4);
+      f.rgba = out; // el cuadro original se libera
+    }
+    anim.w = W;
+    return anim;
+  }
+
   // Bytes del APNG -> bytes del GIF (a "target" px como maximo)
   async function apngToGif(bytes, target) {
     const info = parseApng(bytes);
-    const anim = await apngFrames(info, target);
+    const anim = padFrames(await apngFrames(info, target), gifPad());
     return gifEncode(anim);
   }
 
@@ -1124,6 +1144,11 @@
           onPress: () => set("apngFormat", { png: "webp", webp: "gif", gif: "png" }[cfg("apngFormat")] || "png"),
         }),
         sw("apngAsGif", "APNG animados como GIF", "Los convierte y sube como archivo para que se vean animados. Si falla, manda el link"),
+        h(FormRow, {
+          label: "Tamano del sticker GIF en el chat",
+          subLabel: "Actual: " + gifPad() + " (toca para cambiar: 1.5, 2, 2.5, 3, 4). Si se ve grande, sube el numero; si chico, bajalo",
+          onPress: () => { const o = [1.5, 2, 2.5, 3, 4], i = o.indexOf(gifPad()); set("gifPad", o[(i + 1) % o.length]); },
+        }),
         sw("nativeSheet", "Selector en hoja nativa", "Cierra bien. Apagar solo si el selector se ve mal"),
         sw("animatedPreview", "Vista previa animada", "Los GIF/APNG se mueven en el selector"),
         h(FormRow, {
