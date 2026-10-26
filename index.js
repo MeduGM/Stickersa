@@ -26,7 +26,7 @@
   const S = {}; // stores y modulos de Discord (se llenan en onLoad)
   const state = {
     report: { patched: [], missing: [], similar: [] },
-    spy: { sendMessage: 0, sendStickers: 0, last: "", lastResult: "", converted: 0 },
+    spy: { sendMessage: 0, sendStickers: 0, last: "", lastResult: "", converted: 0, shape: 0, shapeLog: "" },
   };
   const keysOf = (o) => (o && typeof o === "object" ? Object.keys(o).join("|") : String(o));
 
@@ -99,6 +99,35 @@
   function makeNonce() {
     try { return String((BigInt(Date.now()) - 1420070400000n) << 22n); } catch (_) { return undefined; }
   }
+  // El sendMessage de cada version de Discord pide los argumentos de forma distinta
+  // (en la tuya fallaba con "nonce of undefined"). Se prueban varias formas y se recuerda la que sirve.
+  const SHAPES = [
+    (m, x) => [m, undefined, x],                         // (canal, mensaje, undefined, extra={})
+    (m, x) => [m, undefined, { ...x, nonce: m.nonce }],  // extra con nonce
+    (m, x) => [m, true, x],                              // esperando canal listo
+    (m) => [m],                                          // solo mensaje
+  ];
+  const retryable = (e) => /undefined|null|not a function|nonce/i.test(String(e?.message ?? e));
+
+  async function trySend(channelId, msg, extra) {
+    let lastErr;
+    for (let k = 0; k < SHAPES.length; k++) {
+      const i = (state.spy.shape + k) % SHAPES.length;
+      for (const mod of S.msgModules?.length ? S.msgModules : [S.MessageActions]) {
+        try {
+          const res = await mod.sendMessage(channelId, ...SHAPES[i](msg, { ...extra }));
+          state.spy.shape = i;
+          return res;
+        } catch (e) {
+          lastErr = e;
+          state.spy.shapeLog += "forma" + i + ": " + String(e?.message ?? e).slice(0, 60) + " | ";
+          if (!retryable(e)) throw e; // error real de Discord/red: no reintentar (evita duplicados)
+        }
+      }
+    }
+    throw lastErr;
+  }
+
   function sendContent(channelId, content) {
     if (!channelId) channelId = S.SelectedChannelStore?.getChannelId?.();
     if (!channelId || !S.MessageActions) { toast("No hay canal abierto"); return; }
@@ -106,27 +135,19 @@
     const msg = { content, invalidEmojis: [], tts: false, validNonShortcutEmojis: [] };
     const nonce = makeNonce();
     if (nonce) msg.nonce = nonce;
-    let res;
-    try {
-      res = S.MessageActions.sendMessage(channelId, msg, undefined, reply ? reply.extra : undefined);
-    } catch (e) {
-      state.spy.lastResult = "excepcion: " + (e?.message ?? e);
-      toast("Error al enviar: " + String(e?.message ?? e).slice(0, 100));
-      return;
-    }
-    // sendMessage devuelve una promesa; si Discord rechaza el mensaje, avisamos
-    Promise.resolve(res).then(
+    const p = trySend(channelId, msg, reply ? reply.extra : {});
+    p.then(
       (r) => {
         state.spy.lastResult = r && typeof r === "object" ? "ok=" + r.ok + " status=" + r.status : String(r);
         if (r && r.ok === false) toast("Discord rechazo el mensaje: " + String(r.body?.message ?? r.status).slice(0, 100));
+        else if (reply) safe("clear reply", reply.clear);
       },
       (e) => {
-        state.spy.lastResult = "rechazo: " + (e?.message ?? JSON.stringify(e));
+        state.spy.lastResult = "rechazo: " + String(e?.message ?? JSON.stringify(e)) + " @ " + String(e?.stack ?? "").split("\n").slice(0, 3).join(" / ");
         toast("Error al enviar: " + String(e?.message ?? e?.body?.message ?? "desconocido").slice(0, 100));
       }
     );
-    if (reply) safe("clear reply", reply.clear);
-    return res;
+    return p;
   }
 
   // ---------- Catalogo propio (stickers y emojis de todos tus servidores) ----------
@@ -218,12 +239,14 @@
         height: RN.Dimensions.get("window").height * 0.6,
         backgroundColor: "#1e1f22",
         borderTopLeftRadius: 16, borderTopRightRadius: 16,
-        paddingTop: 12, paddingHorizontal: 12, paddingBottom: 24,
+        paddingTop: (RN.StatusBar?.currentHeight ?? 28) + 8, paddingHorizontal: 12, paddingBottom: 24,
       },
     },
       h(RN.View, { style: { flexDirection: "row", marginBottom: 8 } },
         chip("Stickers", isSticker, () => { setTab("sticker"); setGroup("*"); }, "t1"),
-        chip("Emojis", !isSticker, () => { setTab("emoji"); setGroup("*"); }, "t2")),
+        chip("Emojis", !isSticker, () => { setTab("emoji"); setGroup("*"); }, "t2"),
+        h(RN.View, { style: { flex: 1 } }),
+        chip("Cerrar", false, () => safe("hide", () => S.ActionSheet?.hideActionSheet?.()), "close")),
       h(RN.TextInput, {
         value: query, onChangeText: setQuery, placeholder: "Buscar...", placeholderTextColor: "#80848e",
         style: { backgroundColor: "#2b2d31", color: "#fff", borderRadius: 8, paddingHorizontal: 12, height: 40, marginBottom: 8 },
@@ -332,7 +355,7 @@
   function reportText() {
     const r = state.report;
     return (
-      "StickerSender v2.2\n" +
+      "StickerSender v2.3\n" +
       "parcheados: " + (r.patched.join(", ") || "ninguno") + "\n" +
       "no encontrados: " + (r.missing.join(", ") || "ninguno") + "\n" +
       "nombres parecidos: " + (r.similar.slice(0, 60).join(", ") || "ninguno") + "\n" +
@@ -345,6 +368,7 @@
       " | stickers convertidos: " + state.spy.converted + "\n" +
       "ultimo sendMessage: " + (state.spy.last || "ninguno") + "\n" +
       "ultimo resultado propio: " + (state.spy.lastResult || "ninguno") + "\n" +
+      "forma de envio usada: " + state.spy.shape + " | intentos fallidos: " + (state.spy.shapeLog || "ninguno") + "\n" +
       "modulos sendMessage: " + (S.msgModules ? S.msgModules.length : 0) + "\n" +
       "catalogo: " + (safe("cat", () => { const c = getCatalog(true); return c.stickers.length + " stickers, " + c.emojis.length + " emojis"; }) ?? "error")
     );
