@@ -10,6 +10,7 @@
     emojiSize: 48,          // tamaño de emoji grande
     maskEmojiLinks: true,   // emoji dentro de texto: [nombre](url) en vez del link crudo
     animatedStickers: true, // false = manda siempre PNG estatico
+    apngFormat: "png",      // como mandar stickers APNG animados: png | webp | gif (experimental)
     keepOpen: false,        // dejar el selector abierto despues de mandar (para mandar varios)
     nativeUnlock: true,     // intentar desbloquear los selectores nativos de Discord
     debugReport: false,     // copiar reporte al portapapeles en cada inicio
@@ -26,7 +27,7 @@
   const S = {}; // stores y modulos de Discord (se llenan en onLoad)
   const state = {
     report: { patched: [], missing: [], similar: [] },
-    spy: { sendMessage: 0, sendStickers: 0, last: "", lastResult: "", converted: 0, shape: 0, shapeLog: "" },
+    spy: { sendMessage: 0, sendStickers: 0, last: "", lastResult: "", converted: 0, shape: 0, shapeLog: "", fnCalls: {}, lastUrl: "" },
   };
   const keysOf = (o) => (o && typeof o === "object" ? Object.keys(o).join("|") : String(o));
 
@@ -62,7 +63,12 @@
     const type = fmt(s);
     if (type === 3) return null; // Lottie: no existe como imagen
     if (type === 4 && cfg("animatedStickers")) return base + ".gif?size=" + sz;
-    if (type === 2 && cfg("animatedStickers")) return base + ".png?size=" + sz + "&passthrough=true";
+    if (type === 2 && cfg("animatedStickers")) {
+      const f = cfg("apngFormat");
+      if (f === "webp") return base + ".webp?size=" + sz + "&animated=true&quality=lossless";
+      if (f === "gif") return base + ".gif?size=" + sz;
+      return base + ".png?size=" + sz + "&passthrough=true";
+    }
     return base + ".png?size=" + sz + "&passthrough=false";
   }
   function emojiUrl(id, animated) {
@@ -131,6 +137,7 @@
   function sendContent(channelId, content) {
     if (!channelId) channelId = S.SelectedChannelStore?.getChannelId?.();
     if (!channelId || !S.MessageActions) { toast("No hay canal abierto"); return; }
+    state.spy.lastUrl = String(content).slice(0, 200);
     const reply = pendingReply(channelId);
     const msg = { content, invalidEmojis: [], tts: false, validNonShortcutEmojis: [] };
     const nonce = makeNonce();
@@ -163,13 +170,13 @@
         for (const [gid, arr] of entries)
           for (const s of arr ?? []) {
             if (fmt(s) === 3) continue; // Lottie no se puede mandar como imagen
-            stickers.push({ kind: "sticker", key: "sticker:" + s.id, id: s.id, name: s.name ?? "", n: norm(s.name), group: gname(gid), raw: s });
+            stickers.push({ kind: "sticker", key: "sticker:" + s.id, id: s.id, name: s.name ?? "", n: norm(s.name), group: gname(gid), raw: s, tag: fmt(s) === 4 ? "GIF" : fmt(s) === 2 ? "APNG" : "" });
           }
       }
       for (const pack of S.StickersStore?.getPremiumPacks?.() ?? [])
         for (const s of pack.stickers ?? []) {
           if (fmt(s) === 3) continue;
-          stickers.push({ kind: "sticker", key: "sticker:" + s.id, id: s.id, name: s.name ?? "", n: norm(s.name), group: pack.name ?? "Discord", raw: s });
+          stickers.push({ kind: "sticker", key: "sticker:" + s.id, id: s.id, name: s.name ?? "", n: norm(s.name), group: pack.name ?? "Discord", raw: s, tag: fmt(s) === 4 ? "GIF" : fmt(s) === 2 ? "APNG" : "" });
         }
     });
 
@@ -192,6 +199,15 @@
     return catCache;
   }
 
+  // Cierre del selector: se prueban varias formas, y si la hoja no se cierra, el propio contenido se oculta
+  const SHEET_KEY = "StickerSenderPicker";
+  const softClosers = new Set();
+  function closePicker() {
+    safe("close key", () => S.ActionSheet?.hideActionSheet?.(SHEET_KEY));
+    safe("close", () => S.ActionSheet?.hideActionSheet?.());
+    for (const f of [...softClosers]) safe("soft close", f);
+  }
+
   let lastPick = { key: "", at: 0 };
   function pickItem(item, channelId) {
     const now = Date.now();
@@ -199,9 +215,36 @@
     const url = item.kind === "sticker" ? stickerUrl(item.raw) : emojiUrl(item.id, item.animated);
     if (!url) { toast("Ese sticker no se puede mandar como imagen"); return; }
     lastPick = { key: item.key, at: now };
-    if (!cfg("keepOpen")) safe("hide", () => S.ActionSheet?.hideActionSheet?.());
+    if (!cfg("keepOpen")) closePicker();
     pushRecent(item.key);
     sendContent(channelId, url);
+  }
+
+  // ---------- Envio nativo de stickers (cualquier funcion sendSticker*) ----------
+  const hasNitro = () => !!S.UserStore?.getCurrentUser?.()?.premiumType;
+  const channelGuild = (channelId) => S.ChannelStore?.getChannel?.(channelId)?.guild_id;
+
+  function nativeStickerSend(name) {
+    return (args, orig) => {
+      state.spy.fnCalls[name] = (state.spy.fnCalls[name] || 0) + 1;
+      if (name === "sendStickers") state.spy.sendStickers++;
+      const channelId = args[0];
+      if (typeof channelId !== "string" || hasNitro()) return orig(...args);
+      const urls = [];
+      for (const x of [].concat(args[1] ?? [])) {
+        const id = x && typeof x === "object" ? x.id : x;
+        const st = S.StickersStore?.getStickerById?.(id) ?? (x && typeof x === "object" && x.id ? x : null);
+        if (!st) return orig(...args);
+        // Sticker del mismo servidor: el envio normal funciona y se ve mejor
+        if (st.guild_id && st.guild_id === channelGuild(channelId) && st.available !== false) return orig(...args);
+        const url = stickerUrl(st);
+        if (!url) { toast("Los stickers Lottie no se pueden mandar como imagen"); return; }
+        urls.push(url);
+      }
+      if (!urls.length) return orig(...args);
+      const text = typeof args[2] === "string" ? args[2].trim() : "";
+      return sendContent(channelId, (text ? text + "\n" : "") + urls.join("\n"));
+    };
   }
 
   // ---------- Selector (hoja inferior) ----------
@@ -212,7 +255,14 @@
     const [query, setQuery] = React.useState(props.query || "");
     const [group, setGroup] = React.useState("*");
     const [, bump] = React.useReducer((x) => x + 1, 0);
+    const [closed, setClosed] = React.useState(false);
+    const [full, setFull] = React.useState(false);
     const cat = React.useMemo(getCatalog, []);
+    React.useEffect(() => {
+      const f = () => setClosed(true);
+      softClosers.add(f);
+      return () => softClosers.delete(f);
+    }, []);
 
     const isSticker = tab === "sticker";
     const items = isSticker ? cat.stickers : cat.emojis;
@@ -234,19 +284,30 @@
         },
       }, h(RN.Text, { style: { color: "#fff", fontSize: 13 } }, label));
 
+    if (closed) return null;
+    const boxH = Math.round(RN.Dimensions.get("window").height * 0.6);
+    const statusPad = (RN.StatusBar?.currentHeight ?? 28) + 8;
+
+    // Contenedor: si la hoja de Discord ocupa toda la pantalla, el selector queda abajo y tocar
+    // arriba lo cierra. Si la hoja solo mide lo que mide el selector, queda arriba (con margen).
     return h(RN.View, {
+      style: { flex: 1, justifyContent: "flex-end" },
+      onLayout: (e) => { const hh = e?.nativeEvent?.layout?.height ?? 0; setFull(hh > boxH + 40); },
+    },
+      h(RN.Pressable, { style: { flex: 1 }, onPress: closePicker }),
+      h(RN.View, {
       style: {
-        height: RN.Dimensions.get("window").height * 0.6,
+        height: boxH,
         backgroundColor: "#1e1f22",
         borderTopLeftRadius: 16, borderTopRightRadius: 16,
-        paddingTop: (RN.StatusBar?.currentHeight ?? 28) + 8, paddingHorizontal: 12, paddingBottom: 24,
+        paddingTop: full ? 12 : statusPad, paddingHorizontal: 12, paddingBottom: 24,
       },
     },
       h(RN.View, { style: { flexDirection: "row", marginBottom: 8 } },
         chip("Stickers", isSticker, () => { setTab("sticker"); setGroup("*"); }, "t1"),
         chip("Emojis", !isSticker, () => { setTab("emoji"); setGroup("*"); }, "t2"),
         h(RN.View, { style: { flex: 1 } }),
-        chip("Cerrar", false, () => safe("hide", () => S.ActionSheet?.hideActionSheet?.()), "close")),
+        chip("Cerrar", false, closePicker, "close")),
       h(RN.TextInput, {
         value: query, onChangeText: setQuery, placeholder: "Buscar...", placeholderTextColor: "#80848e",
         style: { backgroundColor: "#2b2d31", color: "#fff", borderRadius: 8, paddingHorizontal: 12, height: 40, marginBottom: 8 },
@@ -268,12 +329,13 @@
                 style: { width: "25%", alignItems: "center", padding: 4 },
               },
                 h(RN.Image, { source: { uri: previewUrl(item) }, style: { width: 64, height: 64 }, resizeMode: "contain" }),
-                h(RN.Text, { numberOfLines: 1, style: { color: "#b5bac1", fontSize: 10, marginTop: 2 } }, (favSet.has(item.key) ? "\u2605 " : "") + item.name)),
+                h(RN.Text, { numberOfLines: 1, style: { color: "#b5bac1", fontSize: 10, marginTop: 2 } }, (favSet.has(item.key) ? "\u2605 " : "") + item.name),
+                item.tag ? h(RN.Text, { style: { color: "#5865f2", fontSize: 9, fontWeight: "bold" } }, item.tag) : null),
           })
         : h(RN.Text, { style: { color: "#b5bac1", textAlign: "center", marginTop: 24 } },
             group === "@favs" ? "Mant\u00e9n presionado un sticker o emoji para guardarlo aqu\u00ed"
               : group === "@recents" ? "Aqu\u00ed aparecer\u00e1n los que uses"
-              : items.length ? "Sin resultados" : "No se encontraron " + (isSticker ? "stickers" : "emojis") + " en tus servidores"));
+              : items.length ? "Sin resultados" : "No se encontraron " + (isSticker ? "stickers" : "emojis") + " en tus servidores")));
   }
 
   function openPicker(opts) {
@@ -281,7 +343,7 @@
     const channelId = opts.channelId ?? S.SelectedChannelStore?.getChannelId?.();
     const comp = () => React.createElement(Picker, { ...opts, channelId });
     if (S.ActionSheet?.openLazy)
-      return S.ActionSheet.openLazy(Promise.resolve({ default: comp }), "StickerSenderPicker", {});
+      return S.ActionSheet.openLazy(Promise.resolve({ default: comp }), SHEET_KEY, {});
     const alerts = vendetta.ui.alerts;
     if (alerts?.showCustomAlert) return alerts.showCustomAlert(comp, {});
     toast("No se pudo abrir el selector en esta version");
@@ -295,6 +357,8 @@
     isEmojiFiltered: () => false,
   };
   const CAN_USE_RE = /^canUse(Custom|Animated)?(Emojis?|Stickers?)(Everywhere)?$/;
+  const SEND_STICKER_RE = /^sendStickers?(Message)?$/i;
+  const stickerFns = new Set();
   const NAME_RE = /sendab|unavailablereason|canuse(emoji|sticker|animated|custom)|emojifiltered|premiumlocked/i;
 
   const patchedPairs = new WeakMap(); // holder -> Set(nombres ya parcheados)
@@ -329,6 +393,10 @@
           if (!enumObj && "SENDABLE" in holder && "NONSENDABLE" in holder) enumObj = holder;
           for (const k of Object.keys(holder)) {
             if (NAME_RE.test(k)) seenNames.add(k);
+            if (typeof holder[k] === "function") {
+              if (/sticker/i.test(k) && stickerFns.size < 80) stickerFns.add(k);
+              if (SEND_STICKER_RE.test(k) && !(holder === S.StickerActions && k === "sendStickers")) found.push([holder, k]);
+            }
             if ((k in UNLOCK || CAN_USE_RE.test(k)) && typeof holder[k] === "function") found.push([holder, k]);
           }
         }
@@ -336,7 +404,7 @@
     }
     const r = state.report;
     for (const [holder, name] of pending.splice(0).concat(found)) {
-      let ret = UNLOCK[name] ?? (() => true);
+      let ret = SEND_STICKER_RE.test(name) ? nativeStickerSend(name) : (UNLOCK[name] ?? (() => true));
       if (ret === "sendability") {
         if (!enumObj) { pending.push([holder, name]); continue; }
         const ok = enumObj.SENDABLE;
@@ -355,7 +423,7 @@
   function reportText() {
     const r = state.report;
     return (
-      "StickerSender v2.3\n" +
+      "StickerSender v2.4\n" +
       "parcheados: " + (r.patched.join(", ") || "ninguno") + "\n" +
       "no encontrados: " + (r.missing.join(", ") || "ninguno") + "\n" +
       "nombres parecidos: " + (r.similar.slice(0, 60).join(", ") || "ninguno") + "\n" +
@@ -370,6 +438,9 @@
       "ultimo resultado propio: " + (state.spy.lastResult || "ninguno") + "\n" +
       "forma de envio usada: " + state.spy.shape + " | intentos fallidos: " + (state.spy.shapeLog || "ninguno") + "\n" +
       "modulos sendMessage: " + (S.msgModules ? S.msgModules.length : 0) + "\n" +
+      "llamadas a funciones de sticker: " + (JSON.stringify(state.spy.fnCalls) || "{}") + "\n" +
+      "ultimo contenido enviado: " + (state.spy.lastUrl || "ninguno") + "\n" +
+      "funciones con 'sticker': " + ([...stickerFns].join(", ") || "ninguna") + "\n" +
       "catalogo: " + (safe("cat", () => { const c = getCatalog(true); return c.stickers.length + " stickers, " + c.emojis.length + " emojis"; }) ?? "error")
     );
   }
@@ -406,6 +477,11 @@
         num("emojiSize", "Emoji (normal: 48)")),
       h(FormSection, { title: "Opciones" },
         sw("animatedStickers", "Animados", "Apagado = siempre imagen estatica"),
+        h(FormRow, {
+          label: "Formato de stickers APNG animados",
+          subLabel: "Actual: " + cfg("apngFormat") + " (toca para cambiar: png, webp, gif). Prueba cual se anima",
+          onPress: () => set("apngFormat", { png: "webp", webp: "gif", gif: "png" }[cfg("apngFormat")] || "png"),
+        }),
         sw("keepOpen", "Mantener selector abierto", "Para mandar varios seguidos"),
         sw("maskEmojiLinks", "Ocultar link de emoji", "Muestra [nombre] en vez del link"),
         sw("nativeUnlock", "Desbloquear selectores nativos", "Extra; requiere reiniciar el plugin"),
@@ -451,9 +527,6 @@
       S.SelectedChannelStore = findByStoreName("SelectedChannelStore");
       S.PendingReplyStore = findByStoreName("PendingReplyStore");
       S.FluxDispatcher = safe("flux", () => vendetta.metro.common.FluxDispatcher);
-
-      const hasNitro = () => !!S.UserStore?.getCurrentUser?.()?.premiumType;
-      const channelGuild = (channelId) => S.ChannelStore?.getChannel?.(channelId)?.guild_id;
 
       // 0) Comandos: /sticker [nombre] y /emoji
       safe("comandos", () => {
@@ -501,30 +574,7 @@
       // 2) Stickers bloqueados que llegan por el envio nativo -> link de imagen
       safe("stickers", () => {
         if (!S.StickerActions || !S.StickersStore || !S.MessageActions) return;
-        patches.push(
-          instead("sendStickers", S.StickerActions, (args, orig) => {
-            const [channelId, rawIds, content] = args;
-            state.spy.sendStickers++;
-            if (hasNitro()) return orig(...args);
-
-            const urls = [];
-            let needsOrig = false;
-            for (const id of [].concat(rawIds)) {
-              const s = S.StickersStore.getStickerById(id);
-              if (!s) { needsOrig = true; break; }
-              // Sticker del mismo servidor: el envio normal funciona y se ve mejor
-              if (s.guild_id && s.guild_id === channelGuild(channelId) && s.available !== false) {
-                needsOrig = true; break;
-              }
-              const url = stickerUrl(s);
-              if (!url) { toast("Los stickers Lottie no se pueden mandar como imagen"); return; }
-              urls.push(url);
-            }
-            if (needsOrig) return orig(...args);
-            const text = typeof content === "string" ? content.trim() : "";
-            return sendContent(channelId, (text ? text + "\n" : "") + urls.join("\n"));
-          })
-        );
+        patches.push(instead("sendStickers", S.StickerActions, nativeStickerSend("sendStickers")));
       });
 
       // 3) Hook de sendMessage: convierte stickers (llegue como llegue) y emojis bloqueados
