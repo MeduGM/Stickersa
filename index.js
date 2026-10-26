@@ -321,6 +321,8 @@
     // gh = FlatList de gesture-handler (convive con la hoja) | sheet = la propia hoja hace scroll | rn = normal
     const mode = S.NativeSheet ? (cfg("scrollMode") || "gh") : "rn";
     const ListC = mode === "gh" && S.GHList ? S.GHList : RN.FlatList;
+    // La fila de servidores tambien pelea con el gesto de la hoja: en modo gh/sheet usa el ScrollView de gesture-handler
+    const HScroll = mode !== "rn" && S.GHScroll ? S.GHScroll : RN.ScrollView;
     const emptyMsg = group === "@favs" ? "Mant\u00e9n presionado un sticker o emoji para guardarlo aqu\u00ed"
       : group === "@recents" ? "Aqu\u00ed aparecer\u00e1n los que uses"
       : items.length ? (anim === "anim" ? "No hay animados aqu\u00ed" : anim === "static" ? "No hay no animados aqu\u00ed" : "Sin resultados") : "No se encontraron " + (isSticker ? "stickers" : "emojis") + " en tus servidores";
@@ -340,17 +342,15 @@
         h(RN.View, { style: { flexDirection: "row", marginBottom: 8 } },
           chip("Stickers", isSticker, () => { setTab("sticker"); setGroup("*"); }, "t1"),
           chip("Emojis", !isSticker, () => { setTab("emoji"); setGroup("*"); }, "t2"),
+          chip(anim === "anim" ? "\u25b6 Animados" : anim === "static" ? "No animados" : "Cualquiera",
+            anim !== "all", () => setAnim(anim === "all" ? "anim" : anim === "anim" ? "static" : "all"), "a_filter"),
           h(RN.View, { style: { flex: 1 } }),
           chip("Cerrar", false, closePicker, "close")),
         h(RN.TextInput, {
           value: query, onChangeText: setQuery, placeholder: "Buscar...", placeholderTextColor: "#80848e",
           style: { backgroundColor: "#2b2d31", color: "#fff", borderRadius: 8, paddingHorizontal: 12, height: 40, marginBottom: 8 },
         }),
-        h(RN.View, { style: { flexDirection: "row", marginBottom: 8 } },
-          chip("Todos", anim === "all", () => setAnim("all"), "a_all"),
-          chip("Animados", anim === "anim", () => setAnim("anim"), "a_anim"),
-          chip("No animados", anim === "static", () => setAnim("static"), "a_static")),
-        h(RN.ScrollView, { horizontal: true, showsHorizontalScrollIndicator: false, style: { flexGrow: 0, marginBottom: 8 } },
+        h(HScroll, { horizontal: true, showsHorizontalScrollIndicator: false, nestedScrollEnabled: true, keyboardShouldPersistTaps: "handled", style: { flexGrow: 0, marginBottom: 8 } },
           chip("Todos", group === "*", () => setGroup("*"), "*"),
           chip("\u2605 Favoritos", group === "@favs", () => setGroup("@favs"), "@favs"),
           chip("Recientes", group === "@recents", () => setGroup("@recents"), "@recents"),
@@ -386,11 +386,10 @@
 
   function resolveNativeSheet() {
     S.NativeSheet = null;
-    S.GHList = safe("ghList", () => {
-      const m = findByProps("GestureHandlerRootView") ?? findByProps("FlatList", "ScrollView", "Swipeable");
-      const L = m?.FlatList;
-      return L && (typeof L === "function" || (typeof L === "object" && L.$$typeof)) ? L : null;
-    }) ?? null;
+    const okComp = (c) => c && (typeof c === "function" || (typeof c === "object" && c.$$typeof));
+    const gh = safe("ghMod", () => findByProps("GestureHandlerRootView") ?? findByProps("FlatList", "ScrollView", "Swipeable"));
+    S.GHList = okComp(gh?.FlatList) ? gh.FlatList : null;
+    S.GHScroll = okComp(gh?.ScrollView) ? gh.ScrollView : null;
     if (!cfg("nativeSheet")) return;
     const c = safe("nativeSheet", () => findByProps("ActionSheet")?.ActionSheet);
     if (c && (typeof c === "function" || (typeof c === "object" && c.$$typeof))) S.NativeSheet = c;
@@ -482,14 +481,14 @@
   function reportText() {
     const r = state.report;
     return (
-      "StickerSender v2.7\n" +
+      "StickerSender v2.8\n" +
       "parcheados: " + (r.patched.join(", ") || "ninguno") + "\n" +
       "no encontrados: " + (r.missing.join(", ") || "ninguno") + "\n" +
       "nombres parecidos: " + (r.similar.slice(0, 60).join(", ") || "ninguno") + "\n" +
       "enum SENDABLE: " + !!enumObj + " | modulos revisados: " + scanned.size + "\n" +
       "sendMessage:" + !!S.MessageActions + " sendStickers:" + !!S.StickerActions +
       " StickersStore:" + !!S.StickersStore + " EmojiStore:" + !!S.EmojiStore +
-      " GuildStore:" + !!S.GuildStore + " ActionSheet:" + !!S.ActionSheet + " hojaNativa:" + !!S.NativeSheet + " listaGH:" + !!S.GHList + " scroll:" + cfg("scrollMode") +
+      " GuildStore:" + !!S.GuildStore + " ActionSheet:" + !!S.ActionSheet + " hojaNativa:" + !!S.NativeSheet + " listaGH:" + !!S.GHList + " scrollH:" + !!S.GHScroll + " scroll:" + cfg("scrollMode") +
       " comandos:" + !!vendetta.commands?.registerCommand + "\n" +
       "sendMessage llamadas: " + state.spy.sendMessage + " | sendStickers llamadas: " + state.spy.sendStickers +
       " | stickers convertidos: " + state.spy.converted + "\n" +
