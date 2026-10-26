@@ -1,0 +1,14 @@
+{
+  "name": "StickerSender",
+  "description": "Selector propio de stickers y emojis (/sticker, /emoji): los manda como imagen con tamaño normal.",
+  "authors": [
+    {
+      "name": "Tu nombre"
+    }
+  ],
+  "main": "index.js",
+  "hash": "cffe1aa3071e20569a67f8653f100d364dd024cb96bdd0764766d317f19503b4",
+  "vendetta": {
+    "icon": "ic_image"
+  }
+}
