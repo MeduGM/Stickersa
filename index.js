@@ -11,6 +11,8 @@
     maskEmojiLinks: true,   // emoji dentro de texto: [nombre](url) en vez del link crudo
     animatedStickers: true, // false = manda siempre PNG estatico
     apngFormat: "png",      // como mandar stickers APNG animados: png | webp | gif (experimental)
+    animatedPreview: true,  // el selector propio muestra los animados animados
+    scrollMode: "gh",       // lista del selector: gh (gestos nativos) | rn (normal) | sheet (la hoja se desliza)
     nativeSheet: true,      // selector dentro del ActionSheet nativo (cierra bien). Apagar = modo de respaldo
     keepOpen: false,        // dejar el selector abierto despues de mandar (para mandar varios)
     nativeUnlock: true,     // intentar desbloquear los selectores nativos de Discord
@@ -58,9 +60,9 @@
 
   // ---------- URLs ----------
   // format_type: 1 PNG, 2 APNG, 3 Lottie, 4 GIF
-  function stickerUrl(s) {
+  function stickerUrl(s, szOverride) {
     const base = "https://media.discordapp.net/stickers/" + s.id;
-    const sz = size("stickerSize");
+    const sz = szOverride || size("stickerSize");
     const type = fmt(s);
     if (type === 3) return null; // Lottie: no existe como imagen
     // Igual que el cliente oficial: los animados llevan passthrough=true; sin eso el proxy manda un solo cuadro
@@ -80,10 +82,18 @@
       "?size=" + size("emojiSize") + "&quality=lossless"
     );
   }
-  const previewUrl = (it) =>
-    it.kind === "sticker"
-      ? "https://media.discordapp.net/stickers/" + it.id + ".png?size=96&passthrough=false"
-      : "https://cdn.discordapp.com/emojis/" + it.id + ".webp?size=64&quality=lossless";
+  // Vista previa del selector: animada (GIF/APNG) si "animatedPreview" esta activo
+  const previewUrl = (it) => {
+    if (it.kind === "sticker") {
+      if (cfg("animatedPreview") && it.raw && fmt(it.raw) !== 3) {
+        const u = stickerUrl(it.raw, 96);
+        if (u) return u;
+      }
+      return "https://media.discordapp.net/stickers/" + it.id + ".png?size=96&passthrough=false";
+    }
+    return "https://cdn.discordapp.com/emojis/" + it.id +
+      (it.animated && cfg("animatedPreview") ? ".gif" : ".webp") + "?size=64&quality=lossless";
+  };
 
   // ---------- Envio ----------
   // Si estas respondiendo a un mensaje, mantiene la respuesta
@@ -293,6 +303,35 @@
     const boxH = Math.round(RN.Dimensions.get("window").height * 0.6);
     const statusPad = (RN.StatusBar?.currentHeight ?? 28) + 8;
 
+    const cell = (item) =>
+      h(RN.Pressable, {
+        key: item.kind + item.id,
+        onPress: () => pickItem(item, props.channelId),
+        onLongPress: () => { toast(toggleFav(item.key) ? "Agregado a favoritos" : "Quitado de favoritos"); bump(); },
+        style: { width: "25%", alignItems: "center", padding: 4 },
+      },
+        h(RN.Image, { source: { uri: previewUrl(item) }, style: { width: 64, height: 64 }, resizeMode: "contain" }),
+        h(RN.Text, { numberOfLines: 1, style: { color: "#b5bac1", fontSize: 10, marginTop: 2 } }, (favSet.has(item.key) ? "\u2605 " : "") + item.name),
+        item.tag ? h(RN.Text, { style: { color: "#5865f2", fontSize: 9, fontWeight: "bold" } }, item.tag) : null);
+
+    // Modo de lista: dentro de la hoja nativa, un FlatList normal pelea con el gesto de la hoja y no baja.
+    // gh = FlatList de gesture-handler (convive con la hoja) | sheet = la propia hoja hace scroll | rn = normal
+    const mode = S.NativeSheet ? (cfg("scrollMode") || "gh") : "rn";
+    const ListC = mode === "gh" && S.GHList ? S.GHList : RN.FlatList;
+    const emptyMsg = group === "@favs" ? "Mant\u00e9n presionado un sticker o emoji para guardarlo aqu\u00ed"
+      : group === "@recents" ? "Aqu\u00ed aparecer\u00e1n los que uses"
+      : items.length ? "Sin resultados" : "No se encontraron " + (isSticker ? "stickers" : "emojis") + " en tus servidores";
+    const listNode = !shown.length
+      ? h(RN.Text, { style: { color: "#b5bac1", textAlign: "center", marginTop: 24 } }, emptyMsg)
+      : mode === "sheet"
+        ? h(RN.View, { style: { flexDirection: "row", flexWrap: "wrap" } }, ...shown.map(cell))
+        : h(ListC, {
+            data: shown, numColumns: 4, keyExtractor: (i) => i.kind + i.id,
+            initialNumToRender: 24, windowSize: 5, removeClippedSubviews: false,
+            keyboardShouldPersistTaps: "handled", nestedScrollEnabled: true, style: { flex: 1 },
+            renderItem: ({ item }) => cell(item),
+          });
+
     // Contenido del selector (igual para ambos modos)
     const kids = [
         h(RN.View, { style: { flexDirection: "row", marginBottom: 8 } },
@@ -309,30 +348,14 @@
           chip("\u2605 Favoritos", group === "@favs", () => setGroup("@favs"), "@favs"),
           chip("Recientes", group === "@recents", () => setGroup("@recents"), "@recents"),
           ...groups.map((g) => chip(g, group === g, () => setGroup(g), g))),
-        shown.length
-          ? h(RN.FlatList, {
-              data: shown, numColumns: 4, keyExtractor: (i) => i.kind + i.id,
-              initialNumToRender: 24, windowSize: 5, removeClippedSubviews: true,
-              keyboardShouldPersistTaps: "handled", nestedScrollEnabled: true, style: { flex: 1 },
-              renderItem: ({ item }) =>
-                h(RN.Pressable, {
-                  onPress: () => pickItem(item, props.channelId),
-                  onLongPress: () => { toast(toggleFav(item.key) ? "Agregado a favoritos" : "Quitado de favoritos"); bump(); },
-                  style: { width: "25%", alignItems: "center", padding: 4 },
-                },
-                  h(RN.Image, { source: { uri: previewUrl(item) }, style: { width: 64, height: 64 }, resizeMode: "contain" }),
-                  h(RN.Text, { numberOfLines: 1, style: { color: "#b5bac1", fontSize: 10, marginTop: 2 } }, (favSet.has(item.key) ? "\u2605 " : "") + item.name),
-                  item.tag ? h(RN.Text, { style: { color: "#5865f2", fontSize: 9, fontWeight: "bold" } }, item.tag) : null),
-            })
-          : h(RN.Text, { style: { color: "#b5bac1", textAlign: "center", marginTop: 24 } },
-              group === "@favs" ? "Mant\u00e9n presionado un sticker o emoji para guardarlo aqu\u00ed"
-                : group === "@recents" ? "Aqu\u00ed aparecer\u00e1n los que uses"
-                : items.length ? "Sin resultados" : "No se encontraron " + (isSticker ? "stickers" : "emojis") + " en tus servidores")
+        listNode
     ];
 
     // Modo nativo: dentro del ActionSheet de Discord. Ahi la hoja se ancla abajo, se cierra de verdad
     // (hideActionSheet(clave), tocar fuera, deslizar, atras) y no deja nada tapando la pantalla.
     const NS = S.NativeSheet;
+    if (NS && mode === "sheet")
+      return h(NS, { scrollable: true }, h(RN.View, { style: { paddingBottom: 16 } }, ...kids));
     if (NS)
       return h(NS, null,
         h(RN.View, { style: { height: boxH, paddingBottom: 16 } }, ...kids));
@@ -356,6 +379,11 @@
 
   function resolveNativeSheet() {
     S.NativeSheet = null;
+    S.GHList = safe("ghList", () => {
+      const m = findByProps("GestureHandlerRootView") ?? findByProps("FlatList", "ScrollView", "Swipeable");
+      const L = m?.FlatList;
+      return L && (typeof L === "function" || (typeof L === "object" && L.$$typeof)) ? L : null;
+    }) ?? null;
     if (!cfg("nativeSheet")) return;
     const c = safe("nativeSheet", () => findByProps("ActionSheet")?.ActionSheet);
     if (c && (typeof c === "function" || (typeof c === "object" && c.$$typeof))) S.NativeSheet = c;
@@ -447,14 +475,14 @@
   function reportText() {
     const r = state.report;
     return (
-      "StickerSender v2.5\n" +
+      "StickerSender v2.6\n" +
       "parcheados: " + (r.patched.join(", ") || "ninguno") + "\n" +
       "no encontrados: " + (r.missing.join(", ") || "ninguno") + "\n" +
       "nombres parecidos: " + (r.similar.slice(0, 60).join(", ") || "ninguno") + "\n" +
       "enum SENDABLE: " + !!enumObj + " | modulos revisados: " + scanned.size + "\n" +
       "sendMessage:" + !!S.MessageActions + " sendStickers:" + !!S.StickerActions +
       " StickersStore:" + !!S.StickersStore + " EmojiStore:" + !!S.EmojiStore +
-      " GuildStore:" + !!S.GuildStore + " ActionSheet:" + !!S.ActionSheet + " hojaNativa:" + !!S.NativeSheet +
+      " GuildStore:" + !!S.GuildStore + " ActionSheet:" + !!S.ActionSheet + " hojaNativa:" + !!S.NativeSheet + " listaGH:" + !!S.GHList + " scroll:" + cfg("scrollMode") +
       " comandos:" + !!vendetta.commands?.registerCommand + "\n" +
       "sendMessage llamadas: " + state.spy.sendMessage + " | sendStickers llamadas: " + state.spy.sendStickers +
       " | stickers convertidos: " + state.spy.converted + "\n" +
@@ -507,6 +535,12 @@
           onPress: () => set("apngFormat", { png: "webp", webp: "gif", gif: "png" }[cfg("apngFormat")] || "png"),
         }),
         sw("nativeSheet", "Selector en hoja nativa", "Cierra bien. Apagar solo si el selector se ve mal"),
+        sw("animatedPreview", "Vista previa animada", "Los GIF/APNG se mueven en el selector"),
+        h(FormRow, {
+          label: "Deslizar la lista del selector",
+          subLabel: "Actual: " + cfg("scrollMode") + " (toca para cambiar: gh, sheet, rn). Si no baja, prueba otro",
+          onPress: () => set("scrollMode", { gh: "sheet", sheet: "rn", rn: "gh" }[cfg("scrollMode")] || "gh"),
+        }),
         sw("keepOpen", "Mantener selector abierto", "Para mandar varios seguidos"),
         sw("maskEmojiLinks", "Ocultar link de emoji", "Muestra [nombre] en vez del link"),
         sw("nativeUnlock", "Desbloquear selectores nativos", "Extra; requiere reiniciar el plugin"),
