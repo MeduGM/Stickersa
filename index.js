@@ -269,6 +269,7 @@
     const [tab, setTab] = React.useState(props.tab || "sticker");
     const [query, setQuery] = React.useState(props.query || "");
     const [group, setGroup] = React.useState("*");
+    const [anim, setAnim] = React.useState("all"); // all | anim | static
     const [, bump] = React.useReducer((x) => x + 1, 0);
     const [closed, setClosed] = React.useState(false);
     const [full, setFull] = React.useState(false);
@@ -288,7 +289,9 @@
     const base = special
       ? getList(group === "@recents" ? "recents" : "favs").map((k) => cat.byKey[k]).filter((i) => i && i.kind === tab)
       : items.filter((i) => group === "*" || i.group === group);
-    const shown = q ? base.filter((i) => i.n.includes(q)) : base;
+    const isAnim = (i) => (i.kind === "sticker" ? !!i.tag : !!i.animated);
+    const byAnim = anim === "all" ? base : base.filter((i) => (anim === "anim" ? isAnim(i) : !isAnim(i)));
+    const shown = q ? byAnim.filter((i) => i.n.includes(q)) : byAnim;
 
     const chip = (label, active, onPress, key) =>
       h(RN.Pressable, {
@@ -320,7 +323,7 @@
     const ListC = mode === "gh" && S.GHList ? S.GHList : RN.FlatList;
     const emptyMsg = group === "@favs" ? "Mant\u00e9n presionado un sticker o emoji para guardarlo aqu\u00ed"
       : group === "@recents" ? "Aqu\u00ed aparecer\u00e1n los que uses"
-      : items.length ? "Sin resultados" : "No se encontraron " + (isSticker ? "stickers" : "emojis") + " en tus servidores";
+      : items.length ? (anim === "anim" ? "No hay animados aqu\u00ed" : anim === "static" ? "No hay no animados aqu\u00ed" : "Sin resultados") : "No se encontraron " + (isSticker ? "stickers" : "emojis") + " en tus servidores";
     const listNode = !shown.length
       ? h(RN.Text, { style: { color: "#b5bac1", textAlign: "center", marginTop: 24 } }, emptyMsg)
       : mode === "sheet"
@@ -343,6 +346,10 @@
           value: query, onChangeText: setQuery, placeholder: "Buscar...", placeholderTextColor: "#80848e",
           style: { backgroundColor: "#2b2d31", color: "#fff", borderRadius: 8, paddingHorizontal: 12, height: 40, marginBottom: 8 },
         }),
+        h(RN.View, { style: { flexDirection: "row", marginBottom: 8 } },
+          chip("Todos", anim === "all", () => setAnim("all"), "a_all"),
+          chip("Animados", anim === "anim", () => setAnim("anim"), "a_anim"),
+          chip("No animados", anim === "static", () => setAnim("static"), "a_static")),
         h(RN.ScrollView, { horizontal: true, showsHorizontalScrollIndicator: false, style: { flexGrow: 0, marginBottom: 8 } },
           chip("Todos", group === "*", () => setGroup("*"), "*"),
           chip("\u2605 Favoritos", group === "@favs", () => setGroup("@favs"), "@favs"),
@@ -475,7 +482,7 @@
   function reportText() {
     const r = state.report;
     return (
-      "StickerSender v2.6\n" +
+      "StickerSender v2.7\n" +
       "parcheados: " + (r.patched.join(", ") || "ninguno") + "\n" +
       "no encontrados: " + (r.missing.join(", ") || "ninguno") + "\n" +
       "nombres parecidos: " + (r.similar.slice(0, 60).join(", ") || "ninguno") + "\n" +
