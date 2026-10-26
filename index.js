@@ -10,7 +10,8 @@
     emojiSize: 48,          // tamaño de emoji grande
     maskEmojiLinks: true,   // emoji dentro de texto: [nombre](url) en vez del link crudo
     animatedStickers: true, // false = manda siempre PNG estatico
-    apngFormat: "webp",     // como mandar stickers APNG animados: png | webp | gif (experimental)
+    apngFormat: "png",      // como mandar stickers APNG animados: png | webp | gif (experimental)
+    apngAsGif: true,        // APNG animados: convertirlos a GIF y subirlos como archivo (si falla, se manda el link)
     animatedPreview: true,  // el selector propio muestra los animados animados
     scrollMode: "gh",       // lista del selector: gh (gestos nativos) | rn (normal) | sheet (la hoja se desliza)
     nativeSheet: true,      // selector dentro del ActionSheet nativo (cierra bien). Apagar = modo de respaldo
@@ -60,7 +61,7 @@
 
   // ---------- URLs ----------
   // format_type: 1 PNG, 2 APNG, 3 Lottie, 4 GIF
-  function stickerUrl(s, szOverride, preview) {
+  function stickerUrl(s, szOverride) {
     const base = "https://media.discordapp.net/stickers/" + s.id;
     const sz = szOverride || size("stickerSize");
     const type = fmt(s);
@@ -68,9 +69,8 @@
     // Igual que el cliente oficial: los animados llevan passthrough=true; sin eso el proxy manda un solo cuadro
     if (type === 4 && cfg("animatedStickers")) return base + ".gif?size=" + sz + "&passthrough=true";
     if (type === 2 && cfg("animatedStickers")) {
-      const f = preview ? "png" : cfg("apngFormat");
-      // passthrough=false: el proxy convierte el APNG a WebP animado (con true devolvia el APNG original, que los embeds aplanan)
-      if (f === "webp") return base + ".webp?size=" + sz + "&animated=true&passthrough=false";
+      const f = cfg("apngFormat");
+      if (f === "webp") return base + ".webp?size=" + sz + "&animated=true&passthrough=true";
       if (f === "gif") return base + ".gif?size=" + sz + "&passthrough=true";
       return base + ".png?size=" + sz + "&passthrough=true";
     }
@@ -87,7 +87,7 @@
   const previewUrl = (it) => {
     if (it.kind === "sticker") {
       if (cfg("animatedPreview") && it.raw && fmt(it.raw) !== 3) {
-        const u = stickerUrl(it.raw, 96, true);
+        const u = stickerUrl(it.raw, 96);
         if (u) return u;
       }
       return "https://media.discordapp.net/stickers/" + it.id + ".png?size=96&passthrough=false";
@@ -170,6 +170,584 @@
     return p;
   }
 
+  // ---------- APNG -> GIF (JS puro: Hermes no trae zlib ni canvas) ----------
+  // Lee el APNG cuadro por cuadro y lo reescribe como GIF. Solo se usa para stickers APNG.
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+  const LBASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+  const LEXT = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+  const DBASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
+  const DEXT = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+  const CLORD = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+
+  // Tabla de Huffman: indexada por los proximos "m" bits (LSB primero) -> (simbolo << 4) | largo
+  function huff(lengths, n) {
+    let m = 0;
+    for (let i = 0; i < n; i++) if (lengths[i] > m) m = lengths[i];
+    if (!m) return { t: new Int32Array(2), m: 1 };
+    const count = new Int32Array(16), next = new Int32Array(16);
+    for (let i = 0; i < n; i++) count[lengths[i]]++;
+    count[0] = 0;
+    let code = 0;
+    for (let b = 1; b <= 15; b++) { code = (code + count[b - 1]) << 1; next[b] = code; }
+    const size = 1 << m, t = new Int32Array(size);
+    for (let s = 0; s < n; s++) {
+      const L = lengths[s];
+      if (!L) continue;
+      let c = next[L]++, r = 0;
+      for (let k = 0; k < L; k++) { r = (r << 1) | (c & 1); c >>= 1; }
+      const e = (s << 4) | L;
+      for (let i = r; i < size; i += 1 << L) t[i] = e;
+    }
+    return { t, m };
+  }
+  let FIXED = null;
+  function fixedTables() {
+    if (FIXED) return FIXED;
+    const l = new Int32Array(288);
+    for (let i = 0; i < 288; i++) l[i] = i < 144 ? 8 : i < 256 ? 9 : i < 280 ? 7 : 8;
+    const d = new Int32Array(30).fill(5);
+    return (FIXED = { lit: huff(l, 288), dist: huff(d, 30) });
+  }
+
+  // zlib (cabecera de 2 bytes + deflate); no verifica el checksum
+  function inflateZlib(src, expected) {
+    let pos = 2, bitbuf = 0, bitcnt = 0;
+    let out = new Uint8Array(expected || 65536), op = 0;
+    const grow = (need) => {
+      let n = out.length * 2;
+      while (n < op + need) n *= 2;
+      const t = new Uint8Array(n);
+      t.set(out.subarray(0, op));
+      out = t;
+    };
+    const bits = (n) => {
+      while (bitcnt < n) { bitbuf |= (src[pos++] | 0) << bitcnt; bitcnt += 8; }
+      const v = bitbuf & ((1 << n) - 1);
+      bitbuf >>>= n; bitcnt -= n;
+      return v;
+    };
+    const sym = (h) => {
+      while (bitcnt < h.m) { bitbuf |= (src[pos++] | 0) << bitcnt; bitcnt += 8; }
+      const e = h.t[bitbuf & ((1 << h.m) - 1)];
+      if (!e) throw new Error("inflate: codigo invalido");
+      const L = e & 15;
+      bitbuf >>>= L; bitcnt -= L;
+      return e >> 4;
+    };
+    let last;
+    do {
+      last = bits(1);
+      const type = bits(2);
+      if (type === 0) {
+        const drop = bitcnt & 7;
+        bitbuf >>>= drop; bitcnt -= drop;
+        pos -= bitcnt >> 3;
+        bitbuf = 0; bitcnt = 0;
+        const len = src[pos] | (src[pos + 1] << 8);
+        pos += 4;
+        if (op + len > out.length) grow(len);
+        for (let i = 0; i < len; i++) out[op++] = src[pos++];
+        continue;
+      }
+      let lit, dist;
+      if (type === 1) {
+        const f = fixedTables(); lit = f.lit; dist = f.dist;
+      } else if (type === 2) {
+        const hlit = bits(5) + 257, hdist = bits(5) + 1, hclen = bits(4) + 4;
+        const cl = new Int32Array(19);
+        for (let i = 0; i < hclen; i++) cl[CLORD[i]] = bits(3);
+        const clh = huff(cl, 19);
+        const lens = new Int32Array(hlit + hdist);
+        let i = 0;
+        while (i < hlit + hdist) {
+          const s = sym(clh);
+          if (s < 16) { lens[i++] = s; continue; }
+          let rep, val = 0;
+          if (s === 16) { val = lens[i - 1]; rep = 3 + bits(2); }
+          else if (s === 17) rep = 3 + bits(3);
+          else rep = 11 + bits(7);
+          while (rep-- > 0) lens[i++] = val;
+        }
+        lit = huff(lens.subarray(0, hlit), hlit);
+        dist = huff(lens.subarray(hlit), hdist);
+      } else throw new Error("inflate: bloque invalido");
+      for (;;) {
+        const s = sym(lit);
+        if (s < 256) { if (op >= out.length) grow(1); out[op++] = s; }
+        else if (s === 256) break;
+        else {
+          const li = s - 257;
+          const len = LBASE[li] + bits(LEXT[li]);
+          const ds = sym(dist);
+          const d = DBASE[ds] + bits(DEXT[ds]);
+          if (d > op) throw new Error("inflate: distancia invalida");
+          if (op + len > out.length) grow(len);
+          for (let k = 0; k < len; k++, op++) out[op] = out[op - d];
+        }
+      }
+    } while (!last);
+    return out.subarray(0, op);
+  }
+
+  const PNG_CH = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 };
+  // Datos de imagen de un cuadro (IDAT/fdAT juntos) -> RGBA de 8 bits
+  function decodePngData(parts, w, h, ctype, depth, plte, trns) {
+    const ch = PNG_CH[ctype];
+    if (!ch) throw new Error("tipo de color PNG no soportado");
+    const stride = Math.ceil((w * ch * depth) / 8);
+    let total = 0;
+    for (const p of parts) total += p.length;
+    const z = new Uint8Array(total);
+    let zo = 0;
+    for (const p of parts) { z.set(p, zo); zo += p.length; }
+    const raw = inflateZlib(z, h * (stride + 1));
+    if (raw.length < h * (stride + 1)) throw new Error("datos de imagen incompletos");
+    const bpp = Math.max(1, (ch * depth) >> 3);
+    const data = new Uint8Array(h * stride);
+    for (let y = 0; y < h; y++) {
+      const ft = raw[y * (stride + 1)], rs = y * (stride + 1) + 1, ds = y * stride, up = ds - stride;
+      if (ft === 0) { for (let i = 0; i < stride; i++) data[ds + i] = raw[rs + i]; }
+      else if (ft === 1) { for (let i = 0; i < stride; i++) data[ds + i] = raw[rs + i] + (i >= bpp ? data[ds + i - bpp] : 0); }
+      else if (ft === 2) { for (let i = 0; i < stride; i++) data[ds + i] = raw[rs + i] + (y ? data[up + i] : 0); }
+      else if (ft === 3) {
+        for (let i = 0; i < stride; i++) {
+          const l = i >= bpp ? data[ds + i - bpp] : 0, u = y ? data[up + i] : 0;
+          data[ds + i] = raw[rs + i] + ((l + u) >> 1);
+        }
+      } else if (ft === 4) {
+        for (let i = 0; i < stride; i++) {
+          const a = i >= bpp ? data[ds + i - bpp] : 0, b = y ? data[up + i] : 0, c = i >= bpp && y ? data[up + i - bpp] : 0;
+          const p = a + b - c, pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c);
+          data[ds + i] = raw[rs + i] + (pa <= pb && pa <= pc ? a : pb <= pc ? b : c);
+        }
+      } else throw new Error("filtro PNG invalido");
+    }
+    const out = new Uint8Array(w * h * 4);
+    if (depth === 8 && ctype === 6) {
+      out.set(data);
+    } else if (depth === 8 && ctype === 2) {
+      const key = trns && trns.length >= 6 ? [trns[1], trns[3], trns[5]] : null;
+      for (let i = 0, o = 0; i < data.length; i += 3, o += 4) {
+        const r = data[i], g = data[i + 1], b = data[i + 2];
+        out[o] = r; out[o + 1] = g; out[o + 2] = b;
+        out[o + 3] = key && r === key[0] && g === key[1] && b === key[2] ? 0 : 255;
+      }
+    } else if (depth === 8 && ctype === 3) {
+      if (!plte) throw new Error("falta la paleta");
+      for (let i = 0, o = 0; i < data.length; i++, o += 4) {
+        const k = data[i];
+        out[o] = plte[k * 3]; out[o + 1] = plte[k * 3 + 1]; out[o + 2] = plte[k * 3 + 2];
+        out[o + 3] = trns && k < trns.length ? trns[k] : 255;
+      }
+    } else {
+      const smp = (rs, idx) => {
+        if (depth === 8) return data[rs + idx];
+        if (depth === 16) return (data[rs + 2 * idx] << 8) | data[rs + 2 * idx + 1];
+        const bp = idx * depth;
+        return (data[rs + (bp >> 3)] >> (8 - depth - (bp & 7))) & ((1 << depth) - 1);
+      };
+      const to8 = (v) => (depth === 16 ? v >> 8 : depth === 8 ? v : Math.round((v * 255) / ((1 << depth) - 1)));
+      const tk = (i) => (trns && trns.length >= i * 2 + 2 ? (trns[i * 2] << 8) | trns[i * 2 + 1] : -1);
+      for (let y = 0; y < h; y++) {
+        const rs = y * stride;
+        for (let x = 0; x < w; x++) {
+          const o = (y * w + x) * 4;
+          let r, g, b, a = 255;
+          if (ctype === 0) {
+            const v = smp(rs, x);
+            r = g = b = to8(v);
+            if (v === tk(0)) a = 0;
+          } else if (ctype === 2) {
+            const vr = smp(rs, x * 3), vg = smp(rs, x * 3 + 1), vb = smp(rs, x * 3 + 2);
+            r = to8(vr); g = to8(vg); b = to8(vb);
+            if (vr === tk(0) && vg === tk(1) && vb === tk(2)) a = 0;
+          } else if (ctype === 3) {
+            if (!plte) throw new Error("falta la paleta");
+            const k = smp(rs, x);
+            r = plte[k * 3]; g = plte[k * 3 + 1]; b = plte[k * 3 + 2];
+            a = trns && k < trns.length ? trns[k] : 255;
+          } else if (ctype === 4) {
+            r = g = b = to8(smp(rs, x * 2)); a = to8(smp(rs, x * 2 + 1));
+          } else {
+            r = to8(smp(rs, x * 4)); g = to8(smp(rs, x * 4 + 1)); b = to8(smp(rs, x * 4 + 2)); a = to8(smp(rs, x * 4 + 3));
+          }
+          out[o] = r; out[o + 1] = g; out[o + 2] = b; out[o + 3] = a;
+        }
+      }
+    }
+    return out;
+  }
+
+  // Trozos del archivo APNG -> lista de cuadros (cada uno con sus datos comprimidos)
+  function parseApng(b) {
+    const SIG = [137, 80, 78, 71, 13, 10, 26, 10];
+    for (let i = 0; i < 8; i++) if (b[i] !== SIG[i]) throw new Error("no es un PNG");
+    const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+    let p = 8, ihdr = null, plte = null, trns = null, actl = null, cur = null;
+    const frames = [];
+    while (p + 8 <= b.length) {
+      const len = dv.getUint32(p);
+      const type = String.fromCharCode(b[p + 4], b[p + 5], b[p + 6], b[p + 7]);
+      const d = b.subarray(p + 8, p + 8 + len);
+      if (type === "IHDR") ihdr = { w: dv.getUint32(p + 8), h: dv.getUint32(p + 12), depth: d[8], ctype: d[9], interlace: d[12] };
+      else if (type === "PLTE") plte = d;
+      else if (type === "tRNS") trns = d;
+      else if (type === "acTL") actl = { n: dv.getUint32(p + 8), plays: dv.getUint32(p + 12) };
+      else if (type === "fcTL") {
+        cur = {
+          w: dv.getUint32(p + 12), h: dv.getUint32(p + 16), x: dv.getUint32(p + 20), y: dv.getUint32(p + 24),
+          dn: dv.getUint16(p + 28), dd: dv.getUint16(p + 30), dispose: d[24], blend: d[25], parts: [],
+        };
+        frames.push(cur);
+      } else if (type === "IDAT") { if (cur && frames.length === 1) cur.parts.push(d); } // sin fcTL antes = imagen por defecto, no es parte de la animacion
+      else if (type === "fdAT") { if (cur) cur.parts.push(d.subarray(4)); }
+      else if (type === "IEND") break;
+      p += 12 + len;
+    }
+    if (!ihdr) throw new Error("PNG sin cabecera");
+    if (!actl || frames.length < 2) throw new Error("no es un APNG animado");
+    if (ihdr.interlace) throw new Error("PNG entrelazado no soportado");
+    return { w: ihdr.w, h: ihdr.h, depth: ihdr.depth, ctype: ihdr.ctype, plte, trns, plays: actl.plays, frames };
+  }
+
+  // Promedio por cajas (con el alfa como peso) para achicar el cuadro al tamano del sticker
+  function scaleRGBA(src, W, H, ow, oh) {
+    if (ow === W && oh === H) return src.slice();
+    const out = new Uint8Array(ow * oh * 4);
+    for (let oy = 0; oy < oh; oy++) {
+      const y0 = Math.floor((oy * H) / oh), y1 = Math.max(y0 + 1, Math.ceil(((oy + 1) * H) / oh));
+      for (let ox = 0; ox < ow; ox++) {
+        const x0 = Math.floor((ox * W) / ow), x1 = Math.max(x0 + 1, Math.ceil(((ox + 1) * W) / ow));
+        let sa = 0, sr = 0, sg = 0, sb = 0, n = 0;
+        for (let yy = y0; yy < y1 && yy < H; yy++)
+          for (let xx = x0; xx < x1 && xx < W; xx++) {
+            const i = (yy * W + xx) * 4, a = src[i + 3];
+            sa += a; sr += src[i] * a; sg += src[i + 1] * a; sb += src[i + 2] * a; n++;
+          }
+        const o = (oy * ow + ox) * 4;
+        if (sa > 0) {
+          out[o] = Math.round(sr / sa); out[o + 1] = Math.round(sg / sa); out[o + 2] = Math.round(sb / sa);
+          out[o + 3] = Math.round(sa / n);
+        }
+      }
+    }
+    return out;
+  }
+
+  // Arma cada cuadro completo (dispose/blend de APNG) y lo achica a "target" px como maximo
+  async function apngFrames(info, target) {
+    const W = info.w, H = info.h;
+    const sc = Math.min(1, target / Math.max(W, H));
+    const ow = Math.max(1, Math.round(W * sc)), oh = Math.max(1, Math.round(H * sc));
+    let canvas = new Uint8Array(W * H * 4);
+    const res = [];
+    for (let fi = 0; fi < info.frames.length; fi++) {
+      const fr = info.frames[fi];
+      const px = decodePngData(fr.parts, fr.w, fr.h, info.ctype, info.depth, info.plte, info.trns);
+      const disp = fr.dispose === 2 && fi === 0 ? 1 : fr.dispose;
+      const prev = disp === 2 ? canvas.slice() : null;
+      for (let y = 0; y < fr.h; y++) {
+        const cy = fr.y + y;
+        if (cy >= H) break;
+        for (let x = 0; x < fr.w; x++) {
+          const cx = fr.x + x;
+          if (cx >= W) break;
+          const si = (y * fr.w + x) * 4, di = (cy * W + cx) * 4, sa = px[si + 3];
+          if (fr.blend === 0 || sa === 255 || canvas[di + 3] === 0) {
+            canvas[di] = px[si]; canvas[di + 1] = px[si + 1]; canvas[di + 2] = px[si + 2]; canvas[di + 3] = sa;
+          } else if (sa !== 0) {
+            const da = canvas[di + 3], k = (da * (255 - sa)) / 255, oa = sa + k;
+            canvas[di] = Math.round((px[si] * sa + canvas[di] * k) / oa);
+            canvas[di + 1] = Math.round((px[si + 1] * sa + canvas[di + 1] * k) / oa);
+            canvas[di + 2] = Math.round((px[si + 2] * sa + canvas[di + 2] * k) / oa);
+            canvas[di + 3] = Math.round(oa);
+          }
+        }
+      }
+      const cs = fr.dn === 0 ? 10 : Math.max(2, Math.round((fr.dn / (fr.dd || 100)) * 100));
+      res.push({ rgba: scaleRGBA(canvas, W, H, ow, oh), cs });
+      if (disp === 1) {
+        for (let y = 0; y < fr.h && fr.y + y < H; y++)
+          for (let x = 0; x < fr.w && fr.x + x < W; x++) {
+            const di = ((fr.y + y) * W + fr.x + x) * 4;
+            canvas[di] = canvas[di + 1] = canvas[di + 2] = canvas[di + 3] = 0;
+          }
+      } else if (disp === 2 && prev) canvas = prev;
+      if (fi % 4 === 3) await tick();
+    }
+    return { w: ow, h: oh, frames: res };
+  }
+
+  // Paleta global de 255 colores (median cut sobre un histograma de 15 bits); el indice 255 es el transparente
+  function buildPalette(frames) {
+    const cnt = new Float64Array(32768), sr = new Float64Array(32768), sg = new Float64Array(32768), sb = new Float64Array(32768);
+    for (const f of frames) {
+      const d = f.rgba;
+      for (let i = 0; i < d.length; i += 4) {
+        if (d[i + 3] < 128) continue;
+        const k = ((d[i] >> 3) << 10) | ((d[i + 1] >> 3) << 5) | (d[i + 2] >> 3);
+        cnt[k]++; sr[k] += d[i]; sg[k] += d[i + 1]; sb[k] += d[i + 2];
+      }
+    }
+    const ids = [];
+    for (let k = 0; k < 32768; k++) if (cnt[k] > 0) ids.push(k);
+    const arr = Int32Array.from(ids), lut = new Uint8Array(32768);
+    if (!arr.length) return { pal: [[0, 0, 0]], lut };
+    const stat = (b) => {
+      let r0 = 31, r1 = 0, g0 = 31, g1 = 0, b0 = 31, b1 = 0, pop = 0;
+      for (let i = b.lo; i < b.hi; i++) {
+        const id = arr[i], r = id >> 10, g = (id >> 5) & 31, bl = id & 31;
+        if (r < r0) r0 = r; if (r > r1) r1 = r;
+        if (g < g0) g0 = g; if (g > g1) g1 = g;
+        if (bl < b0) b0 = bl; if (bl > b1) b1 = bl;
+        pop += cnt[id];
+      }
+      const rr = r1 - r0, gr = g1 - g0, br = b1 - b0;
+      b.pop = pop;
+      b.ch = rr >= gr && rr >= br ? 0 : gr >= br ? 1 : 2;
+      b.range = Math.max(rr, gr, br);
+      b.score = b.range * Math.sqrt(pop);
+    };
+    const boxes = [{ lo: 0, hi: arr.length }];
+    stat(boxes[0]);
+    while (boxes.length < 255) {
+      let bi = -1, best = 0;
+      for (let i = 0; i < boxes.length; i++) {
+        const b = boxes[i];
+        if (b.hi - b.lo > 1 && b.range > 0 && b.score > best) { best = b.score; bi = i; }
+      }
+      if (bi < 0) break;
+      const b = boxes[bi], shift = b.ch === 0 ? 10 : b.ch === 1 ? 5 : 0;
+      const tmp = Array.from(arr.subarray(b.lo, b.hi));
+      tmp.sort((p, q) => ((p >> shift) & 31) - ((q >> shift) & 31));
+      arr.set(tmp, b.lo);
+      const half = b.pop / 2;
+      let acc = 0, mid = b.lo + 1;
+      for (let i = b.lo; i < b.hi - 1; i++) { acc += cnt[arr[i]]; mid = i + 1; if (acc >= half) break; }
+      const nb = { lo: mid, hi: b.hi };
+      b.hi = mid;
+      stat(b); stat(nb);
+      boxes.push(nb);
+    }
+    const pal = [];
+    boxes.forEach((b, bi) => {
+      let R = 0, G = 0, B = 0, N = 0;
+      for (let i = b.lo; i < b.hi; i++) { const id = arr[i]; R += sr[id]; G += sg[id]; B += sb[id]; N += cnt[id]; lut[id] = bi; }
+      pal.push([Math.round(R / N), Math.round(G / N), Math.round(B / N)]);
+    });
+    return { pal, lut };
+  }
+
+  // LZW de GIF. "table" (Int32Array de 1<<20) se reutiliza entre cuadros
+  function lzwEncode(idx, minCode, table) {
+    const clear = 1 << minCode, eoi = clear + 1;
+    let out = new Uint8Array(((idx.length * 3) >> 1) + 1024), op = 0, cur = 0, curBits = 0;
+    const emit = (code, size) => {
+      cur |= code << curBits;
+      curBits += size;
+      while (curBits >= 8) {
+        if (op >= out.length) { const t = new Uint8Array(out.length * 2); t.set(out); out = t; }
+        out[op++] = cur & 255;
+        cur >>>= 8; curBits -= 8;
+      }
+    };
+    table.fill(0);
+    let size = minCode + 1, next = eoi + 1;
+    emit(clear, size);
+    let c = idx[0];
+    for (let i = 1; i < idx.length; i++) {
+      const k = idx[i], key = (c << 8) | k, hit = table[key];
+      if (hit) { c = hit; continue; }
+      emit(c, size);
+      if (next === 4096) { emit(clear, size); table.fill(0); size = minCode + 1; next = eoi + 1; }
+      else { if (next >= 1 << size) size++; table[key] = next++; }
+      c = k;
+    }
+    emit(c, size);
+    emit(eoi, size);
+    if (curBits > 0) { if (op >= out.length) { const t = new Uint8Array(out.length + 1); t.set(out); out = t; } out[op++] = cur & 255; }
+    return out.subarray(0, op);
+  }
+
+  async function gifEncode(anim) {
+    const { w, h, frames } = anim;
+    const { pal, lut } = buildPalette(frames);
+    const parts = [];
+    parts.push(new Uint8Array([71, 73, 70, 56, 57, 97, w & 255, w >> 8, h & 255, h >> 8, 0xf7, 0, 0]));
+    const gct = new Uint8Array(768);
+    pal.forEach((c, i) => { gct[i * 3] = c[0]; gct[i * 3 + 1] = c[1]; gct[i * 3 + 2] = c[2]; });
+    parts.push(gct);
+    // bucle infinito
+    parts.push(new Uint8Array([0x21, 0xff, 0x0b, 78, 69, 84, 83, 67, 65, 80, 69, 50, 46, 48, 3, 1, 0, 0, 0]));
+    const table = new Int32Array(1 << 20);
+    for (let fi = 0; fi < frames.length; fi++) {
+      const f = frames[fi], d = f.rgba, idx = new Uint8Array(w * h);
+      for (let i = 0, j = 0; j < idx.length; i += 4, j++) {
+        idx[j] = d[i + 3] < 128 ? 255 : lut[((d[i] >> 3) << 10) | ((d[i + 1] >> 3) << 5) | (d[i + 2] >> 3)];
+      }
+      // disposal 2 (volver al fondo) + transparencia 255: cada cuadro reemplaza al anterior
+      parts.push(new Uint8Array([0x21, 0xf9, 4, (2 << 2) | 1, f.cs & 255, f.cs >> 8, 255, 0]));
+      parts.push(new Uint8Array([0x2c, 0, 0, 0, 0, w & 255, w >> 8, h & 255, h >> 8, 0, 8]));
+      const data = lzwEncode(idx, 8, table);
+      for (let o = 0; o < data.length; o += 255) {
+        const n = Math.min(255, data.length - o);
+        const blk = new Uint8Array(n + 1);
+        blk[0] = n;
+        blk.set(data.subarray(o, o + n), 1);
+        parts.push(blk);
+      }
+      parts.push(new Uint8Array([0]));
+      if (fi % 3 === 2) await tick();
+    }
+    parts.push(new Uint8Array([0x3b]));
+    let total = 0;
+    for (const p of parts) total += p.length;
+    const out = new Uint8Array(total);
+    let o = 0;
+    for (const p of parts) { out.set(p, o); o += p.length; }
+    return out;
+  }
+
+  // Bytes del APNG -> bytes del GIF (a "target" px como maximo)
+  async function apngToGif(bytes, target) {
+    const info = parseApng(bytes);
+    const anim = await apngFrames(info, target);
+    return gifEncode(anim);
+  }
+
+  // ---------- APNG -> GIF: descarga y subida ----------
+  const gifState = { last: "", ok: 0, fail: 0 };
+  const getToken = () => {
+    for (const f of [
+      () => findByStoreName("AuthenticationStore")?.getToken?.(),
+      () => findByProps("getToken")?.getToken?.(),
+    ]) {
+      const t = safe("token", f);
+      if (typeof t === "string" && t.length > 20) return t;
+    }
+    return null;
+  };
+  // APNG animado y todo lo necesario para convertirlo
+  const wantGif = (st) => !!st && fmt(st) === 2 && !!cfg("apngAsGif") && !!cfg("animatedStickers") && !!getToken();
+
+  const asciiBytes = (s) => {
+    const b = new Uint8Array(s.length);
+    for (let i = 0; i < s.length; i++) b[i] = s.charCodeAt(i) & 255;
+    return b;
+  };
+  // JSON solo ASCII (los caracteres raros van como \uXXXX) para poder armar el multipart a mano
+  const jsonAscii = (o) => JSON.stringify(o).replace(/[\u0080-\uffff]/g, (c) => "\\u" + ("0000" + c.charCodeAt(0).toString(16)).slice(-4));
+
+  function buildMultipart(boundary, payload, filename, fileBytes) {
+    const head = asciiBytes(
+      "--" + boundary + "\r\nContent-Disposition: form-data; name=\"payload_json\"\r\nContent-Type: application/json\r\n\r\n" +
+      jsonAscii(payload) + "\r\n--" + boundary +
+      "\r\nContent-Disposition: form-data; name=\"files[0]\"; filename=\"" + filename + "\"\r\nContent-Type: image/gif\r\n\r\n"
+    );
+    const tail = asciiBytes("\r\n--" + boundary + "--\r\n");
+    const out = new Uint8Array(head.length + fileBytes.length + tail.length);
+    out.set(head, 0);
+    out.set(fileBytes, head.length);
+    out.set(tail, head.length + fileBytes.length);
+    return out;
+  }
+
+  function xhrGetBytes(url) {
+    return new Promise((resolve, reject) => {
+      const x = new XMLHttpRequest();
+      x.open("GET", url);
+      x.responseType = "arraybuffer";
+      x.timeout = 25000;
+      x.onload = () => {
+        if (x.status >= 200 && x.status < 300 && x.response) resolve(new Uint8Array(x.response));
+        else reject(new Error("HTTP " + x.status));
+      };
+      x.onerror = () => reject(new Error("sin red"));
+      x.ontimeout = () => reject(new Error("tiempo agotado"));
+      x.send();
+    });
+  }
+  // El APNG original (con passthrough el proxy no lo toca); si no, el CDN
+  async function downloadApng(id) {
+    let lastErr;
+    for (const url of [
+      "https://media.discordapp.net/stickers/" + id + ".png?size=320&passthrough=true",
+      "https://cdn.discordapp.com/stickers/" + id + ".png",
+    ]) {
+      try {
+        const b = await xhrGetBytes(url);
+        if (b.length > 8 && b[1] === 80 && b[2] === 78) return b;
+        lastErr = new Error("respuesta no es PNG");
+      } catch (e) { lastErr = e; }
+    }
+    throw lastErr || new Error("no se pudo bajar el sticker");
+  }
+
+  function postMultipart(url, token, boundary, body) {
+    return new Promise((resolve, reject) => {
+      const x = new XMLHttpRequest();
+      x.open("POST", url);
+      x.setRequestHeader("Authorization", token);
+      x.setRequestHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
+      x.timeout = 60000;
+      x.onload = () => resolve({ status: x.status, text: String(x.responseText || "") });
+      x.onerror = () => reject(new Error("sin red"));
+      x.ontimeout = () => reject(new Error("tiempo agotado"));
+      x.send(body);
+    });
+  }
+
+  // Manda el GIF como archivo adjunto en el canal (respeta la respuesta pendiente)
+  async function uploadGif(channelId, gif, name, text) {
+    const token = getToken();
+    if (!token) throw new Error("no hay sesion");
+    const reply = pendingReply(channelId);
+    const payload = { content: text || "", tts: false, flags: 0, attachments: [{ id: 0, filename: name }] };
+    const nonce = makeNonce();
+    if (nonce) payload.nonce = nonce;
+    if (reply) {
+      payload.message_reference = reply.extra.messageReference;
+      payload.allowed_mentions = reply.extra.allowedMentions;
+    }
+    const boundary = "----StickerSender" + Date.now().toString(16);
+    const res = await postMultipart(
+      "https://discord.com/api/v9/channels/" + channelId + "/messages",
+      token, boundary, buildMultipart(boundary, payload, name, gif)
+    );
+    if (res.status < 200 || res.status >= 300) {
+      let msg = res.text.slice(0, 120);
+      try { msg = JSON.parse(res.text).message || msg; } catch (_) {}
+      throw new Error("Discord " + res.status + ": " + msg);
+    }
+    if (reply) safe("clear reply", reply.clear);
+  }
+
+  // Sticker APNG -> GIF -> archivo. Si algo falla, se manda el link como antes.
+  async function sendApngGif(channelId, st, text, fallbackUrl) {
+    if (!channelId) channelId = S.SelectedChannelStore?.getChannelId?.();
+    const fallback = (why) => {
+      gifState.fail++;
+      gifState.last = "fallo: " + why;
+      console.warn(TAG, "APNG->GIF fallo:", why);
+      toast("No se pudo mandar como GIF (" + String(why).slice(0, 60) + "). Mando el link.");
+      sendContent(channelId, (text ? text + "\n" : "") + fallbackUrl);
+    };
+    if (!channelId) return fallback("sin canal");
+    try {
+      toast("Convirtiendo sticker a GIF...");
+      const t0 = Date.now();
+      const bytes = await downloadApng(st.id);
+      const gif = await apngToGif(bytes, size("stickerSize"));
+      if (gif.length > 9 * 1024 * 1024) throw new Error("GIF demasiado grande");
+      const name = (String(st.name || "sticker").replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 40) || "sticker") + ".gif";
+      await uploadGif(channelId, gif, name, text);
+      gifState.ok++;
+      gifState.last = "ok " + gif.length + " bytes en " + (Date.now() - t0) + " ms";
+    } catch (e) {
+      fallback(String(e?.message ?? e));
+    }
+  }
+
   // ---------- Catalogo propio (stickers y emojis de todos tus servidores) ----------
   function buildCatalogRaw() {
     const guilds = safe("guilds", () => S.GuildStore?.getGuilds?.()) ?? {};
@@ -233,6 +811,7 @@
     lastPick = { key: item.key, at: now };
     if (!cfg("keepOpen")) closePicker();
     pushRecent(item.key);
+    if (item.kind === "sticker" && wantGif(item.raw)) { sendApngGif(channelId, item.raw, "", url); return; }
     sendContent(channelId, url);
   }
 
@@ -246,7 +825,7 @@
       if (name === "sendStickers") state.spy.sendStickers++;
       const channelId = args[0];
       if (typeof channelId !== "string" || hasNitro()) return orig(...args);
-      const urls = [];
+      const urls = [], sts = [];
       for (const x of [].concat(args[1] ?? [])) {
         const id = x && typeof x === "object" ? x.id : x;
         const st = S.StickersStore?.getStickerById?.(id) ?? (x && typeof x === "object" && x.id ? x : null);
@@ -256,9 +835,11 @@
         const url = stickerUrl(st);
         if (!url) { toast("Los stickers Lottie no se pueden mandar como imagen"); return; }
         urls.push(url);
+        sts.push(st);
       }
       if (!urls.length) return orig(...args);
       const text = typeof args[2] === "string" ? args[2].trim() : "";
+      if (urls.length === 1 && wantGif(sts[0])) { sendApngGif(channelId, sts[0], text, urls[0]); return; }
       return sendContent(channelId, (text ? text + "\n" : "") + urls.join("\n"));
     };
   }
@@ -482,7 +1063,7 @@
   function reportText() {
     const r = state.report;
     return (
-      "StickerSender v2.8\n" +
+      "StickerSender v2.9\n" +
       "parcheados: " + (r.patched.join(", ") || "ninguno") + "\n" +
       "no encontrados: " + (r.missing.join(", ") || "ninguno") + "\n" +
       "nombres parecidos: " + (r.similar.slice(0, 60).join(", ") || "ninguno") + "\n" +
@@ -498,6 +1079,7 @@
       "forma de envio usada: " + state.spy.shape + " | intentos fallidos: " + (state.spy.shapeLog || "ninguno") + "\n" +
       "modulos sendMessage: " + (S.msgModules ? S.msgModules.length : 0) + "\n" +
       "llamadas a funciones de sticker: " + (JSON.stringify(state.spy.fnCalls) || "{}") + "\n" +
+      "ultimo APNG->GIF: " + (gifState.last || "ninguno") + " | ok: " + gifState.ok + " | fallos: " + gifState.fail + "\n" +
       "ultimo contenido enviado: " + (state.spy.lastUrl || "ninguno") + "\n" +
       "funciones con 'sticker': " + ([...stickerFns].join(", ") || "ninguna") + "\n" +
       "catalogo: " + (safe("cat", () => { const c = getCatalog(true); return c.stickers.length + " stickers, " + c.emojis.length + " emojis"; }) ?? "error")
@@ -541,6 +1123,7 @@
           subLabel: "Actual: " + cfg("apngFormat") + " (toca para cambiar: png, webp, gif). Prueba cual se anima",
           onPress: () => set("apngFormat", { png: "webp", webp: "gif", gif: "png" }[cfg("apngFormat")] || "png"),
         }),
+        sw("apngAsGif", "APNG animados como GIF", "Los convierte y sube como archivo para que se vean animados. Si falla, manda el link"),
         sw("nativeSheet", "Selector en hoja nativa", "Cierra bien. Apagar solo si el selector se ve mal"),
         sw("animatedPreview", "Vista previa animada", "Los GIF/APNG se mueven en el selector"),
         h(FormRow, {
