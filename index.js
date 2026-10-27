@@ -13,6 +13,7 @@
     apngFormat: "png",      // como mandar stickers APNG animados: png | webp | gif (experimental)
     apngAsGif: true,        // APNG animados: convertirlos a GIF y subirlos como archivo (si falla, se manda el link)
     gifPad: 2,              // ancho del lienzo del GIF / ancho del sticker (mas alto = sticker mas chico en el chat)
+    pickerCols: 4,          // columnas del selector (3 a 6)
     animatedPreview: true,  // el selector propio muestra los animados animados
     scrollMode: "gh",       // lista del selector: gh (gestos nativos) | rn (normal) | sheet (la hoja se desliza)
     nativeSheet: true,      // selector dentro del ActionSheet nativo (cierra bien). Apagar = modo de respaldo
@@ -52,7 +53,23 @@
     try { const v = vendetta.plugin.storage[k]; return Array.isArray(v) ? [...v] : []; } catch (_) { return []; }
   };
   const setList = (k, v) => safe("guardar", () => { vendetta.plugin.storage[k] = v; });
-  const pushRecent = (key) => setList("recents", [key, ...getList("recents").filter((x) => x !== key)].slice(0, 40));
+  // Contador de usos (para el grupo "Mas usados"); objeto { clave: veces }, se poda para no crecer sin limite
+  const getUses = () => {
+    try { const v = vendetta.plugin.storage.uses; return v && typeof v === "object" && !Array.isArray(v) ? v : {}; } catch (_) { return {}; }
+  };
+  const pushRecent = (key) => {
+    setList("recents", [key, ...getList("recents").filter((x) => x !== key)].slice(0, 40));
+    safe("usos", () => {
+      const u = { ...getUses() };
+      u[key] = (u[key] || 0) + 1;
+      const ks = Object.keys(u);
+      if (ks.length > 300) {
+        ks.sort((a, b) => u[a] - u[b]);
+        for (const k of ks.slice(0, ks.length - 250)) delete u[k];
+      }
+      setList("uses", u);
+    });
+  };
   function toggleFav(key) {
     const f = getList("favs");
     const i = f.indexOf(key);
@@ -638,6 +655,8 @@
 
   // ---------- APNG -> GIF: descarga y subida ----------
   const gifState = { last: "", ok: 0, fail: 0 };
+  const gifCache = new Map(); // id|tamano|margen -> bytes del GIF (ultimos 8)
+  const gifBusy = new Set();  // canal:sticker que se estan convirtiendo ahora
   const getToken = () => {
     for (const f of [
       () => findByStoreName("AuthenticationStore")?.getToken?.(),
@@ -754,18 +773,32 @@
       sendContent(channelId, (text ? text + "\n" : "") + fallbackUrl);
     };
     if (!channelId) return fallback("sin canal");
+    // Si ese mismo sticker ya se esta convirtiendo/subiendo en este canal, un toque repetido se ignora (evita duplicados)
+    const busyKey = channelId + ":" + st.id;
+    if (gifBusy.has(busyKey)) return;
+    gifBusy.add(busyKey);
     try {
-      toast("Convirtiendo sticker a GIF...");
       const t0 = Date.now();
-      const bytes = await downloadApng(st.id);
-      const gif = await apngToGif(bytes, size("stickerSize"));
-      if (gif.length > 9 * 1024 * 1024) throw new Error("GIF demasiado grande");
+      // Los ultimos GIF convertidos se recuerdan: mandar de nuevo el mismo sticker es casi instantaneo
+      const ck = st.id + "|" + size("stickerSize") + "|" + gifPad();
+      let gif = gifCache.get(ck);
+      if (gif) { gifCache.delete(ck); gifCache.set(ck, gif); }
+      else {
+        toast("Convirtiendo sticker a GIF...");
+        const bytes = await downloadApng(st.id);
+        gif = await apngToGif(bytes, size("stickerSize"));
+        if (gif.length > 9 * 1024 * 1024) throw new Error("GIF demasiado grande");
+        gifCache.set(ck, gif);
+        while (gifCache.size > 8) gifCache.delete(gifCache.keys().next().value);
+      }
       const name = (String(st.name || "sticker").replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 40) || "sticker") + ".gif";
       await uploadGif(channelId, gif, name, text);
       gifState.ok++;
       gifState.last = "ok " + gif.length + " bytes en " + (Date.now() - t0) + " ms";
     } catch (e) {
       fallback(String(e?.message ?? e));
+    } finally {
+      gifBusy.delete(busyKey);
     }
   }
 
@@ -945,14 +978,43 @@
     const items = isSticker ? cat.stickers : cat.emojis;
     const groups = isSticker ? cat.stickerGroups : cat.emojiGroups;
     const q = norm(query.trim());
-    const special = group === "@recents" || group === "@favs";
+    const special = group === "@recents" || group === "@favs" || group === "@top";
     const favSet = new Set(getList("favs"));
+    // Cuantos hay en cada servidor (se muestra en el chip)
+    const counts = React.useMemo(() => {
+      const c = {};
+      for (const i of items) c[i.group] = (c[i.group] || 0) + 1;
+      return c;
+    }, [items]);
+    const topList = () => {
+      const u = getUses();
+      return Object.keys(u).filter((k) => u[k] > 0).sort((a, b) => u[b] - u[a]).map((k) => cat.byKey[k]).filter((i) => i && i.kind === tab).slice(0, 48);
+    };
     const base = special
-      ? getList(group === "@recents" ? "recents" : "favs").map((k) => cat.byKey[k]).filter((i) => i && i.kind === tab)
+      ? (group === "@top" ? topList() : getList(group === "@recents" ? "recents" : "favs").map((k) => cat.byKey[k]).filter((i) => i && i.kind === tab))
       : items.filter((i) => group === "*" || i.group === group);
     const isAnim = (i) => (i.kind === "sticker" ? !!i.tag : !!i.animated);
     const byAnim = anim === "all" ? base : base.filter((i) => (anim === "anim" ? isAnim(i) : !isAnim(i)));
-    const shown = q ? byAnim.filter((i) => i.n.includes(q)) : byAnim;
+    // Busqueda: varias palabras (todas deben coincidir) en el nombre del sticker/emoji o en el del servidor;
+    // primero los que coinciden exacto o por el principio del nombre
+    const gOf = (i) => i._g || (i._g = norm(i.group));
+    const toks = q ? q.split(/\s+/).filter(Boolean) : [];
+    const score = (i) => {
+      let s = 0;
+      for (const t of toks) {
+        if (i.n === t) s += 4;
+        else if (i.n.startsWith(t)) s += 3;
+        else if (i.n.includes(t)) s += 2;
+        else if (gOf(i).includes(t)) s += 1;
+        else return 0;
+      }
+      return s;
+    };
+    const shown = q
+      ? byAnim.map((i, idx) => ({ i, idx, s: score(i) })).filter((x) => x.s > 0).sort((a, b) => b.s - a.s || a.idx - b.idx).map((x) => x.i)
+      : byAnim;
+    const cols = [3, 4, 5, 6].includes(Number(cfg("pickerCols"))) ? Number(cfg("pickerCols")) : 4;
+    const imgSz = { 3: 84, 4: 64, 5: 54, 6: 46 }[cols];
 
     const chip = (label, active, onPress, key) =>
       h(RN.Pressable, {
@@ -972,9 +1034,9 @@
         key: item.kind + item.id,
         onPress: () => pickItem(item, props.channelId),
         onLongPress: () => { toast(toggleFav(item.key) ? "Agregado a favoritos" : "Quitado de favoritos"); bump(); },
-        style: { width: "25%", alignItems: "center", padding: 4 },
+        style: { width: 100 / cols + "%", alignItems: "center", padding: 4 },
       },
-        h(RN.Image, { source: { uri: previewUrl(item) }, style: { width: 64, height: 64 }, resizeMode: "contain" }),
+        h(RN.Image, { source: { uri: previewUrl(item) }, style: { width: imgSz, height: imgSz }, resizeMode: "contain" }),
         h(RN.Text, { numberOfLines: 1, style: { color: "#b5bac1", fontSize: 10, marginTop: 2 } }, (favSet.has(item.key) ? "\u2605 " : "") + item.name),
         item.tag ? h(RN.Text, { style: { color: "#5865f2", fontSize: 9, fontWeight: "bold" } }, item.tag) : null);
 
@@ -986,13 +1048,14 @@
     const HScroll = mode !== "rn" && S.GHScroll ? S.GHScroll : RN.ScrollView;
     const emptyMsg = group === "@favs" ? "Mant\u00e9n presionado un sticker o emoji para guardarlo aqu\u00ed"
       : group === "@recents" ? "Aqu\u00ed aparecer\u00e1n los que uses"
+      : group === "@top" ? "Aqu\u00ed aparecer\u00e1n los que m\u00e1s uses"
       : items.length ? (anim === "anim" ? "No hay animados aqu\u00ed" : anim === "static" ? "No hay no animados aqu\u00ed" : "Sin resultados") : isSticker && !cat.live && Date.now() - openedAt < 120000 ? "Cargando stickers..." : "No se encontraron " + (isSticker ? "stickers" : "emojis") + " en tus servidores";
     const listNode = !shown.length
       ? h(RN.Text, { style: { color: "#b5bac1", textAlign: "center", marginTop: 24 } }, emptyMsg)
       : mode === "sheet"
         ? h(RN.View, { style: { flexDirection: "row", flexWrap: "wrap" } }, ...shown.map(cell))
         : h(ListC, {
-            data: shown, numColumns: 4, keyExtractor: (i) => i.kind + i.id,
+            key: "cols" + cols, data: shown, numColumns: cols, keyExtractor: (i) => i.kind + i.id,
             initialNumToRender: 24, windowSize: 5, removeClippedSubviews: false,
             keyboardShouldPersistTaps: "handled", nestedScrollEnabled: true, style: { flex: 1 },
             renderItem: ({ item }) => cell(item),
@@ -1015,7 +1078,8 @@
           chip("Todos", group === "*", () => setGroup("*"), "*"),
           chip("\u2605 Favoritos", group === "@favs", () => setGroup("@favs"), "@favs"),
           chip("Recientes", group === "@recents", () => setGroup("@recents"), "@recents"),
-          ...groups.map((g) => chip(g, group === g, () => setGroup(g), g))),
+          chip("Más usados", group === "@top", () => setGroup("@top"), "@top"),
+          ...groups.map((g) => chip(g + " (" + (counts[g] || 0) + ")", group === g, () => setGroup(g), g))),
         listNode
     ];
 
@@ -1056,11 +1120,35 @@
     if (c && (typeof c === "function" || (typeof c === "object" && c.$$typeof))) S.NativeSheet = c;
   }
 
+  // Si el selector llegara a fallar al dibujarse, se muestra un aviso en vez de tumbar la pantalla/la app
+  let Boundary = null;
+  function getBoundary(React, RN) {
+    if (Boundary) return Boundary;
+    Boundary = safe("boundary", () => {
+      class B extends React.Component {
+        constructor(p) { super(p); this.state = { err: null }; }
+        static getDerivedStateFromError(err) { return { err }; }
+        componentDidCatch(err) { state.pickerError = String(err?.message ?? err).slice(0, 200); console.error(TAG, "selector fallo:", err); }
+        render() {
+          if (!this.state.err) return this.props.children;
+          return React.createElement(RN.View, { style: { padding: 24, backgroundColor: "#1e1f22" } },
+            React.createElement(RN.Text, { style: { color: "#fff" } }, "El selector falló: " + String(this.state.err?.message ?? this.state.err).slice(0, 120)));
+        }
+      }
+      return B;
+    });
+    return Boundary;
+  }
+
   function openPicker(opts) {
-    const { React } = vendetta.metro.common;
+    const { React, ReactNative: RN } = vendetta.metro.common;
     resolveNativeSheet();
     const channelId = opts.channelId ?? S.SelectedChannelStore?.getChannelId?.();
-    const comp = () => React.createElement(Picker, { ...opts, channelId });
+    const comp = () => {
+      const pick = React.createElement(Picker, { ...opts, channelId });
+      const B = getBoundary(React, RN);
+      return B ? React.createElement(B, null, pick) : pick;
+    };
     if (S.ActionSheet?.openLazy)
       return S.ActionSheet.openLazy(Promise.resolve({ default: comp }), SHEET_KEY, {});
     const alerts = vendetta.ui.alerts;
@@ -1157,6 +1245,7 @@
       "ultimo resultado propio: " + (state.spy.lastResult || "ninguno") + "\n" +
       "forma de envio usada: " + state.spy.shape + " | intentos fallidos: " + (state.spy.shapeLog || "ninguno") + "\n" +
       "modulos sendMessage: " + (S.msgModules ? S.msgModules.length : 0) + "\n" +
+      "ultimo error del selector: " + (state.pickerError || "ninguno") + "\n" +
       "llamadas a funciones de sticker: " + (JSON.stringify(state.spy.fnCalls) || "{}") + "\n" +
       "ultimo APNG->GIF: " + (gifState.last || "ninguno") + " | ok: " + gifState.ok + " | fallos: " + gifState.fail + "\n" +
       "ultimo contenido enviado: " + (state.spy.lastUrl || "ninguno") + "\n" +
@@ -1204,6 +1293,11 @@
         }),
         sw("apngAsGif", "APNG animados como GIF", "Los convierte y sube como archivo para que se vean animados. Si falla, manda el link"),
         h(FormRow, {
+          label: "Columnas del selector",
+          subLabel: "Actual: " + cfg("pickerCols") + " (toca para cambiar: 3, 4, 5, 6)",
+          onPress: () => { const o = [3, 4, 5, 6], i = o.indexOf(Number(cfg("pickerCols"))); set("pickerCols", o[(i + 1) % o.length]); },
+        }),
+        h(FormRow, {
           label: "Tamano del sticker GIF en el chat",
           subLabel: "Actual: " + gifPad() + " (toca para cambiar: 1.5, 2, 2.5, 3, 4). Si se ve grande, sube el numero; si chico, bajalo",
           onPress: () => { const o = [1.5, 2, 2.5, 3, 4], i = o.indexOf(gifPad()); set("gifPad", o[(i + 1) % o.length]); },
@@ -1221,9 +1315,9 @@
         sw("debugReport", "Copiar reporte al iniciar", "Para diagnosticar")),
       h(FormSection, { title: "Datos" },
         h(FormRow, {
-          label: "Borrar recientes",
-          subLabel: getList("recents").length + " guardados | " + getList("favs").length + " favoritos",
-          onPress: () => { setList("recents", []); force(); toast("Recientes borrados"); },
+          label: "Borrar recientes y más usados",
+          subLabel: getList("recents").length + " recientes | " + Object.keys(getUses()).length + " con usos | " + getList("favs").length + " favoritos",
+          onPress: () => { setList("recents", []); setList("uses", {}); force(); toast("Recientes y más usados borrados"); },
         }),
         h(FormRow, {
           label: "Restablecer ajustes",
@@ -1302,10 +1396,25 @@
         }));
         patches.push(reg({
           ...base, name: "emoji", displayName: "emoji",
-          description: "Abre el selector de emojis de todos tus servidores",
-          displayDescription: "Abre el selector de emojis de todos tus servidores",
-          options: [],
-          execute: (args, ctx) => { openPicker({ tab: "emoji", channelId: ctx?.channel?.id }); },
+          description: "Abre el selector de emojis (o manda uno por nombre)",
+          displayDescription: "Abre el selector de emojis (o manda uno por nombre)",
+          options: [{
+            name: "nombre", displayName: "nombre", description: "Nombre del emoji",
+            displayDescription: "Nombre del emoji", required: false, type: 3,
+          }],
+          execute: (args, ctx) => {
+            const channelId = ctx?.channel?.id;
+            const raw = String(arg(args, "nombre") ?? "").trim();
+            const q = norm(raw);
+            if (q) {
+              const all = getCatalog().emojis;
+              const exact = all.filter((s) => s.n === q);
+              const part = all.filter((s) => s.n.includes(q));
+              const one = exact.length === 1 ? exact[0] : part.length === 1 ? part[0] : null;
+              if (one) { pickItem(one, channelId); return; }
+            }
+            openPicker({ tab: "emoji", query: raw, channelId });
+          },
         }));
       });
 
