@@ -30,6 +30,7 @@
   const EMOJI_RE = /<(a?):(\w+):(\d+)>/g;
   const patches = [];
   const timers = [];
+  let scanTimer = null;
   const unsubs = [];
   const S = {}; // stores y modulos de Discord (se llenan en onLoad)
   const state = {
@@ -104,6 +105,7 @@
   }
   // Vista previa del selector: animada (GIF/APNG) si "animatedPreview" esta activo
   const previewUrl = (it) => {
+    if (it.local) return localUri(it.lib); // importado de la galeria: la imagen va dentro del propio plugin
     if (it.kind === "sticker") {
       if (cfg("animatedPreview") && it.raw && fmt(it.raw) !== 3) {
         const u = stickerUrl(it.raw, 96);
@@ -678,11 +680,11 @@
   // JSON solo ASCII (los caracteres raros van como \uXXXX) para poder armar el multipart a mano
   const jsonAscii = (o) => JSON.stringify(o).replace(/[\u0080-\uffff]/g, (c) => "\\u" + ("0000" + c.charCodeAt(0).toString(16)).slice(-4));
 
-  function buildMultipart(boundary, payload, filename, fileBytes) {
+  function buildMultipart(boundary, payload, filename, fileBytes, mime) {
     const head = asciiBytes(
       "--" + boundary + "\r\nContent-Disposition: form-data; name=\"payload_json\"\r\nContent-Type: application/json\r\n\r\n" +
       jsonAscii(payload) + "\r\n--" + boundary +
-      "\r\nContent-Disposition: form-data; name=\"files[0]\"; filename=\"" + filename + "\"\r\nContent-Type: image/gif\r\n\r\n"
+      "\r\nContent-Disposition: form-data; name=\"files[0]\"; filename=\"" + filename + "\"\r\nContent-Type: " + (mime || "image/gif") + "\r\n\r\n"
     );
     const tail = asciiBytes("\r\n--" + boundary + "--\r\n");
     const out = new Uint8Array(head.length + fileBytes.length + tail.length);
@@ -738,7 +740,7 @@
   }
 
   // Manda el GIF como archivo adjunto en el canal (respeta la respuesta pendiente)
-  async function uploadGif(channelId, gif, name, text) {
+  async function uploadGif(channelId, gif, name, text, mime) {
     const token = getToken();
     if (!token) throw new Error("no hay sesion");
     const reply = pendingReply(channelId);
@@ -752,7 +754,7 @@
     const boundary = "----StickerSender" + Date.now().toString(16);
     const res = await postMultipart(
       "https://discord.com/api/v9/channels/" + channelId + "/messages",
-      token, boundary, buildMultipart(boundary, payload, name, gif)
+      token, boundary, buildMultipart(boundary, payload, name, gif, mime)
     );
     if (res.status < 200 || res.status >= 300) {
       let msg = res.text.slice(0, 120);
@@ -789,7 +791,14 @@
         gif = await apngToGif(bytes, size("stickerSize"));
         if (gif.length > 9 * 1024 * 1024) throw new Error("GIF demasiado grande");
         gifCache.set(ck, gif);
-        while (gifCache.size > 8) gifCache.delete(gifCache.keys().next().value);
+        // maximo 8 GIF y 6 MB en total (los mas viejos se descartan primero)
+        let tot = 0;
+        for (const g of gifCache.values()) tot += g.length;
+        while (gifCache.size > 1 && (gifCache.size > 8 || tot > 6 * 1024 * 1024)) {
+          const k = gifCache.keys().next().value;
+          tot -= gifCache.get(k).length;
+          gifCache.delete(k);
+        }
       }
       const name = (String(st.name || "sticker").replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 40) || "sticker") + ".gif";
       await uploadGif(channelId, gif, name, text);
@@ -799,6 +808,743 @@
       fallback(String(e?.message ?? e));
     } finally {
       gifBusy.delete(busyKey);
+    }
+  }
+
+  // ======================================================================================
+  // ---------- Importar imagenes de la galeria (stickers / emojis propios) ----------
+  // ======================================================================================
+  // Codecs en JS puro (Hermes no trae canvas ni zlib): base64, PNG (leer y escribir) y GIF (leer).
+  const B64S = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  let B64R = null, B64E = null;
+  function b64decode(str) {
+    if (!B64R) {
+      B64R = new Int16Array(256).fill(-1);
+      for (let i = 0; i < 64; i++) B64R[B64S.charCodeAt(i)] = i;
+      B64R[45] = 62; B64R[95] = 63; // variante url-safe
+    }
+    const s = String(str), len = s.length;
+    const out = new Uint8Array(Math.floor((len * 3) / 4) + 3);
+    let acc = 0, bits = 0, op = 0;
+    for (let i = 0; i < len; i++) {
+      const c = s.charCodeAt(i), v = c < 256 ? B64R[c] : -1;
+      if (v < 0) continue; // "=", espacios y saltos de linea
+      acc = (acc << 6) | v; bits += 6;
+      if (bits >= 8) { bits -= 8; out[op++] = (acc >> bits) & 255; acc &= (1 << bits) - 1; }
+    }
+    return out.subarray(0, op);
+  }
+  function b64encode(u8) {
+    if (!B64E) { B64E = new Uint8Array(64); for (let i = 0; i < 64; i++) B64E[i] = B64S.charCodeAt(i); }
+    const n = u8.length, olen = Math.ceil(n / 3) * 4, o = new Uint8Array(olen);
+    let op = 0;
+    for (let i = 0; i < n; i += 3) {
+      const a = u8[i], b = i + 1 < n ? u8[i + 1] : 0, c = i + 2 < n ? u8[i + 2] : 0;
+      o[op++] = B64E[a >> 2];
+      o[op++] = B64E[((a & 3) << 4) | (b >> 4)];
+      o[op++] = i + 1 < n ? B64E[((b & 15) << 2) | (c >> 6)] : 61;
+      o[op++] = i + 2 < n ? B64E[c & 63] : 61;
+    }
+    const parts = [];
+    for (let i = 0; i < olen; i += 8192) parts.push(String.fromCharCode.apply(null, o.subarray(i, Math.min(olen, i + 8192))));
+    return parts.join("");
+  }
+
+  // Tipo de imagen por sus primeros bytes
+  function sniffImage(b) {
+    if (!b || b.length < 16) return null;
+    if (b[0] === 137 && b[1] === 80 && b[2] === 78 && b[3] === 71) return "png";
+    if (b[0] === 71 && b[1] === 73 && b[2] === 70) return "gif";
+    if (b[0] === 255 && b[1] === 216 && b[2] === 255) return "jpg";
+    if (b[0] === 82 && b[1] === 73 && b[2] === 70 && b[3] === 70 && b[8] === 87 && b[9] === 69 && b[10] === 66 && b[11] === 80) return "webp";
+    return null;
+  }
+  // Medidas y si es animado, sin decodificar (para JPG/WebP y para el aviso previo)
+  function quickInfo(b, type) {
+    let w = 0, h = 0, animated = false;
+    try {
+      if (type === "png") {
+        w = ((b[16] << 24) | (b[17] << 16) | (b[18] << 8) | b[19]) >>> 0;
+        h = ((b[20] << 24) | (b[21] << 16) | (b[22] << 8) | b[23]) >>> 0;
+        let p = 8;
+        while (p + 8 <= b.length) {
+          const len = ((b[p] << 24) | (b[p + 1] << 16) | (b[p + 2] << 8) | b[p + 3]) >>> 0;
+          const t = String.fromCharCode(b[p + 4], b[p + 5], b[p + 6], b[p + 7]);
+          if (t === "acTL") { animated = true; break; }
+          if (t === "IDAT" || t === "IEND") break;
+          p += 12 + len;
+        }
+      } else if (type === "gif") {
+        w = b[6] | (b[7] << 8); h = b[8] | (b[9] << 8);
+        animated = true; // se confirma al decodificar
+      } else if (type === "jpg") {
+        let p = 2;
+        while (p + 9 < b.length && b[p] === 255) {
+          const m = b[p + 1];
+          if (m === 255) { p++; continue; }
+          if (m >= 0xc0 && m <= 0xcf && m !== 0xc4 && m !== 0xc8 && m !== 0xcc) { h = (b[p + 5] << 8) | b[p + 6]; w = (b[p + 7] << 8) | b[p + 8]; break; }
+          p += 2 + ((b[p + 2] << 8) | b[p + 3]);
+        }
+      } else if (type === "webp") {
+        const t = String.fromCharCode(b[12], b[13], b[14], b[15]);
+        if (t === "VP8X") { animated = !!(b[20] & 2); w = 1 + (b[24] | (b[25] << 8) | (b[26] << 16)); h = 1 + (b[27] | (b[28] << 8) | (b[29] << 16)); }
+        else if (t === "VP8L") { const v = (b[21] | (b[22] << 8) | (b[23] << 16) | (b[24] << 24)) >>> 0; w = (v & 0x3fff) + 1; h = ((v >>> 14) & 0x3fff) + 1; }
+        else if (t === "VP8 ") { w = (b[26] | (b[27] << 8)) & 0x3fff; h = (b[28] | (b[29] << 8)) & 0x3fff; }
+      }
+    } catch (_) {}
+    return { w, h, animated };
+  }
+
+  // PNG normal (no animado): una sola imagen -> RGBA
+  function parsePngStatic(b) {
+    const SIG = [137, 80, 78, 71, 13, 10, 26, 10];
+    for (let i = 0; i < 8; i++) if (b[i] !== SIG[i]) throw new Error("no es un PNG");
+    const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+    let p = 8, ihdr = null, plte = null, trns = null;
+    const parts = [];
+    while (p + 8 <= b.length) {
+      const len = dv.getUint32(p);
+      const type = String.fromCharCode(b[p + 4], b[p + 5], b[p + 6], b[p + 7]);
+      const d = b.subarray(p + 8, p + 8 + len);
+      if (type === "IHDR") ihdr = { w: dv.getUint32(p + 8), h: dv.getUint32(p + 12), depth: d[8], ctype: d[9], interlace: d[12] };
+      else if (type === "PLTE") plte = d;
+      else if (type === "tRNS") trns = d;
+      else if (type === "IDAT") parts.push(d);
+      else if (type === "IEND") break;
+      p += 12 + len;
+    }
+    if (!ihdr || !parts.length) throw new Error("PNG incompleto");
+    if (ihdr.interlace) throw new Error("PNG entrelazado no soportado");
+    if (!ihdr.w || !ihdr.h || ihdr.w * ihdr.h > 36e6) throw new Error("imagen demasiado grande");
+    return { w: ihdr.w, h: ihdr.h, rgba: decodePngData(parts, ihdr.w, ihdr.h, ihdr.ctype, ihdr.depth, plte, trns) };
+  }
+
+  // LZW de GIF (lectura)
+  function lzwDecode(data, minCode, npix) {
+    const clear = 1 << minCode, eoi = clear + 1;
+    const out = new Uint8Array(npix), prefix = new Int16Array(4096), suffix = new Uint8Array(4096), stack = new Uint8Array(4097);
+    for (let i = 0; i < clear; i++) suffix[i] = i;
+    let size = minCode + 1, next = eoi + 1, mask = (1 << size) - 1, bits = 0, nb = 0, pos = 0, op = 0, prev = -1, first = 0;
+    while (op < npix) {
+      while (nb < size && pos < data.length) { bits |= data[pos++] << nb; nb += 8; }
+      if (nb < size) break;
+      const code = bits & mask;
+      bits >>>= size; nb -= size;
+      if (code === clear) { size = minCode + 1; next = eoi + 1; mask = (1 << size) - 1; prev = -1; continue; }
+      if (code === eoi) break;
+      if (prev === -1) { first = suffix[code]; out[op++] = first; prev = code; continue; }
+      let sp = 0, cur;
+      if (code >= next) { stack[sp++] = first; cur = prev; } else cur = code;
+      while (cur >= clear) { stack[sp++] = suffix[cur]; cur = prefix[cur]; }
+      first = suffix[cur];
+      stack[sp++] = first;
+      if (next < 4096) {
+        prefix[next] = prev; suffix[next] = first; next++;
+        if (next > mask && size < 12) { size++; mask = (1 << size) - 1; }
+      }
+      prev = code;
+      while (sp > 0 && op < npix) out[op++] = stack[--sp];
+    }
+    return out;
+  }
+
+  // GIF -> cuadros RGBA completos (con disposal y transparencia), ya achicados a "target" px como maximo.
+  // Si tiene mas de "maxFrames" cuadros se saltan algunos (sumando sus tiempos) para no gastar memoria.
+  async function decodeGif(b, target, maxFrames) {
+    if (b[0] !== 71 || b[1] !== 73 || b[2] !== 70) throw new Error("no es un GIF");
+    const W = b[6] | (b[7] << 8), H = b[8] | (b[9] << 8);
+    if (!W || !H || W * H > 16e6) throw new Error("GIF demasiado grande");
+    let p = 10;
+    const pk = b[p++];
+    p += 2;
+    let gct = null;
+    if (pk & 0x80) { const n = 3 << ((pk & 7) + 1); gct = b.subarray(p, p + n); p += n; }
+    // 1) recorrer los bloques sin decodificar
+    const imgs = [];
+    let gce = null;
+    while (p < b.length) {
+      const t = b[p++];
+      if (t === 0x3b) break;
+      if (t === 0x21) {
+        const label = b[p++];
+        if (label === 0xf9) {
+          const f = b[p + 1];
+          gce = { disposal: (f >> 2) & 7, transp: f & 1 ? b[p + 4] : -1, delay: b[p + 2] | (b[p + 3] << 8) };
+        }
+        let n;
+        while (p < b.length && (n = b[p++])) p += n;
+        continue;
+      }
+      if (t !== 0x2c) throw new Error("GIF danado");
+      const im = { x: b[p] | (b[p + 1] << 8), y: b[p + 2] | (b[p + 3] << 8), w: b[p + 4] | (b[p + 5] << 8), h: b[p + 6] | (b[p + 7] << 8), gce };
+      const fl = b[p + 8];
+      p += 9;
+      im.ct = gct;
+      if (fl & 0x80) { const n = 3 << ((fl & 7) + 1); im.ct = b.subarray(p, p + n); p += n; }
+      im.interlaced = !!(fl & 0x40);
+      im.minCode = b[p++];
+      im.chunks = [];
+      let n, total = 0;
+      while (p < b.length && (n = b[p++])) { im.chunks.push(b.subarray(p, p + n)); total += n; p += n; }
+      im.total = total;
+      imgs.push(im);
+      gce = null;
+    }
+    if (!imgs.length) throw new Error("GIF sin cuadros");
+    // 2) componer
+    const step = Math.max(1, Math.ceil(imgs.length / (maxFrames || 90)));
+    const sc = Math.min(1, target / Math.max(W, H));
+    const ow = Math.max(1, Math.round(W * sc)), oh = Math.max(1, Math.round(H * sc));
+    let canvas = new Uint8Array(W * H * 4);
+    const frames = [];
+    for (let fi = 0; fi < imgs.length; fi++) {
+      const im = imgs[fi], ct = im.ct;
+      if (!ct) throw new Error("GIF sin paleta");
+      const raw = new Uint8Array(im.total);
+      let o = 0;
+      for (const c of im.chunks) { raw.set(c, o); o += c.length; }
+      const idx = lzwDecode(raw, im.minCode, im.w * im.h);
+      const g = im.gce, disposal = g ? g.disposal : 0, tr = g ? g.transp : -1;
+      const prev = disposal === 3 ? canvas.slice() : null;
+      for (let y = 0; y < im.h; y++) {
+        let sy = y;
+        if (im.interlaced) { // las filas vienen en 4 pasadas
+          const q = im.h, p1 = (q + 7) >> 3, p2 = (q + 3) >> 3, p3 = (q + 1) >> 2;
+          sy = y < p1 ? y * 8 : y < p1 + p2 ? (y - p1) * 8 + 4 : y < p1 + p2 + p3 ? (y - p1 - p2) * 4 + 2 : (y - p1 - p2 - p3) * 2 + 1;
+        }
+        const cy = im.y + sy;
+        if (cy >= H) continue;
+        for (let x = 0; x < im.w; x++) {
+          const cx = im.x + x;
+          if (cx >= W) break;
+          const k = idx[y * im.w + x];
+          if (k === tr) continue;
+          const di = (cy * W + cx) * 4;
+          canvas[di] = ct[k * 3]; canvas[di + 1] = ct[k * 3 + 1]; canvas[di + 2] = ct[k * 3 + 2]; canvas[di + 3] = 255;
+        }
+      }
+      const cs = g && g.delay > 1 ? g.delay : 10;
+      if (fi % step === 0) frames.push({ rgba: scaleRGBA(canvas, W, H, ow, oh), cs });
+      else frames[frames.length - 1].cs += cs;
+      if (disposal === 2) {
+        for (let y = 0; y < im.h && im.y + y < H; y++)
+          for (let x = 0; x < im.w && im.x + x < W; x++) {
+            const di = ((im.y + y) * W + im.x + x) * 4;
+            canvas[di] = canvas[di + 1] = canvas[di + 2] = canvas[di + 3] = 0;
+          }
+      } else if (disposal === 3 && prev) canvas = prev;
+      if (fi % 4 === 3) await tick();
+    }
+    for (const f of frames) f.cs = Math.min(f.cs, 65535);
+    return { w: ow, h: oh, frames };
+  }
+
+  // Achica cuadros sueltos (PNG normal) a "target" px como maximo
+  async function scaleFrames(frames, W, H, target) {
+    const sc = Math.min(1, target / Math.max(W, H));
+    const ow = Math.max(1, Math.round(W * sc)), oh = Math.max(1, Math.round(H * sc));
+    for (let i = 0; i < frames.length; i++) {
+      frames[i].rgba = scaleRGBA(frames[i].rgba, W, H, ow, oh);
+      if (i % 4 === 3) await tick();
+    }
+    return { w: ow, h: oh, frames };
+  }
+  // Quita cuadros de sobra (sumando sus tiempos) para que el GIF no pese demasiado
+  function decimate(frames, max) {
+    if (frames.length <= max) return frames;
+    const step = Math.ceil(frames.length / max), out = [];
+    for (let i = 0; i < frames.length; i += step) {
+      let cs = 0;
+      for (let j = i; j < Math.min(i + step, frames.length); j++) cs += frames[j].cs;
+      out.push({ rgba: frames[i].rgba, cs: Math.min(cs, 65535) });
+    }
+    return out;
+  }
+
+  // PNG (escritura): deflate con codigos fijos + LZ77 sencillo. Los margenes transparentes casi no pesan.
+  let CRCT = null, LCODE = null, DCODE = null;
+  function crc32(u8) {
+    if (!CRCT) {
+      CRCT = new Int32Array(256);
+      for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; CRCT[n] = c; }
+    }
+    let c = -1;
+    for (let i = 0; i < u8.length; i++) c = CRCT[(c ^ u8[i]) & 255] ^ (c >>> 8);
+    return (c ^ -1) >>> 0;
+  }
+  function adler32(u8) {
+    let a = 1, b = 0;
+    for (let i = 0; i < u8.length;) {
+      const e = Math.min(u8.length, i + 5552);
+      for (; i < e; i++) { a += u8[i]; b += a; }
+      a %= 65521; b %= 65521;
+    }
+    return ((b << 16) | a) >>> 0;
+  }
+  function deflateFixed(src) {
+    if (!LCODE) {
+      LCODE = new Uint8Array(259);
+      for (let c = 0; c < 29; c++) {
+        const hi = c === 28 ? 258 : LBASE[c] + (1 << LEXT[c]) - 1;
+        for (let l = LBASE[c]; l <= hi; l++) LCODE[l] = c;
+      }
+      DCODE = new Uint8Array(32769);
+      for (let c = 0; c < 30; c++) {
+        const hi = DBASE[c] + (1 << DEXT[c]) - 1;
+        for (let d = DBASE[c]; d <= hi && d <= 32768; d++) DCODE[d] = c;
+      }
+    }
+    let out = new Uint8Array(Math.max(1024, (src.length >> 1) + 1024)), op = 0, bb = 0, bc = 0;
+    const put = (v, n) => {
+      bb |= v << bc; bc += n;
+      while (bc >= 8) {
+        if (op >= out.length) { const t = new Uint8Array(out.length * 2); t.set(out); out = t; }
+        out[op++] = bb & 255; bb >>>= 8; bc -= 8;
+      }
+    };
+    const rev = (v, n) => { let r = 0; for (let i = 0; i < n; i++) { r = (r << 1) | (v & 1); v >>= 1; } return r; };
+    const lit = (s) => {
+      if (s < 144) put(rev(0x30 + s, 8), 8);
+      else if (s < 256) put(rev(0x190 + s - 144, 9), 9);
+      else if (s < 280) put(rev(s - 256, 7), 7);
+      else put(rev(0xc0 + s - 280, 8), 8);
+    };
+    put(1, 1); put(1, 2); // ultimo bloque, codigos fijos
+    const n = src.length, head = new Int32Array(1 << 15).fill(-1), prevp = new Int32Array(Math.max(1, n));
+    const hash = (i) => ((src[i] << 10) ^ (src[i + 1] << 5) ^ src[i + 2]) & 32767;
+    const insert = (p) => { if (p + 2 < n) { const h = hash(p); prevp[p] = head[h]; head[h] = p; } };
+    let i = 0;
+    while (i < n) {
+      let bestLen = 0, bestDist = 0;
+      if (i + 2 < n) {
+        let cand = head[hash(i)], chain = 0;
+        const max = Math.min(258, n - i);
+        while (cand >= 0 && i - cand <= 32768 && chain++ < 16) {
+          let l = 0;
+          while (l < max && src[cand + l] === src[i + l]) l++;
+          if (l > bestLen) { bestLen = l; bestDist = i - cand; if (l === max) break; }
+          cand = prevp[cand];
+        }
+      }
+      if (bestLen >= 3) {
+        const lc = LCODE[bestLen], dc = DCODE[bestDist];
+        lit(257 + lc);
+        if (LEXT[lc]) put(bestLen - LBASE[lc], LEXT[lc]);
+        put(rev(dc, 5), 5);
+        if (DEXT[dc]) put(bestDist - DBASE[dc], DEXT[dc]);
+        for (let k = 0; k < bestLen; k++) insert(i + k);
+        i += bestLen;
+      } else { lit(src[i]); insert(i); i++; }
+    }
+    lit(256);
+    if (bc > 0) put(0, 8 - bc);
+    return out.subarray(0, op);
+  }
+  function pngEncode(w, h, rgba) {
+    const stride = w * 4, raw = new Uint8Array(h * (stride + 1));
+    for (let y = 0; y < h; y++) { // filtro "Sub": deja casi todo en ceros
+      const o = y * (stride + 1), s = y * stride;
+      raw[o] = 1;
+      for (let i = 0; i < stride; i++) raw[o + 1 + i] = (rgba[s + i] - (i >= 4 ? rgba[s + i - 4] : 0)) & 255;
+    }
+    const def = deflateFixed(raw), ad = adler32(raw);
+    const z = new Uint8Array(def.length + 6);
+    z[0] = 0x78; z[1] = 0x01; z.set(def, 2);
+    z[z.length - 4] = ad >>> 24; z[z.length - 3] = (ad >>> 16) & 255; z[z.length - 2] = (ad >>> 8) & 255; z[z.length - 1] = ad & 255;
+    const chunk = (type, data) => {
+      const c = new Uint8Array(12 + data.length), dv = new DataView(c.buffer);
+      dv.setUint32(0, data.length);
+      for (let i = 0; i < 4; i++) c[4 + i] = type.charCodeAt(i);
+      c.set(data, 8);
+      dv.setUint32(8 + data.length, crc32(c.subarray(4, 8 + data.length)));
+      return c;
+    };
+    const ihdr = new Uint8Array(13), idv = new DataView(ihdr.buffer);
+    idv.setUint32(0, w); idv.setUint32(4, h); ihdr[8] = 8; ihdr[9] = 6;
+    const parts = [new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]), chunk("IHDR", ihdr), chunk("IDAT", z), chunk("IEND", new Uint8Array(0))];
+    let total = 0;
+    for (const x of parts) total += x.length;
+    const out = new Uint8Array(total);
+    let o = 0;
+    for (const x of parts) { out.set(x, o); o += x.length; }
+    return out;
+  }
+
+  // ---------- Biblioteca de importados ----------
+  // Cada importado se guarda ya achicado (PNG si es estatico, GIF si es animado) y se manda como archivo,
+  // igual que los APNG convertidos. Se guarda en un archivo propio (para no hinchar los ajustes del plugin);
+  // si esta version no permite archivos, se usa el almacenamiento del plugin con un limite mas bajo.
+  const LIB_MAX_ITEM = 2 * 1024 * 1024; // lo que ocupa un importado ya procesado
+  const LIB_MAX_SRC = 12 * 1024 * 1024; // el archivo original que se elige
+  const lib = { store: null, ready: false, mode: "", err: "" };
+  const importState = { last: "", ok: 0, fail: 0, sent: 0, pickers: "" };
+  let libInit = null;
+  const libItems = () => {
+    try { const it = lib.store && lib.store.items; return Array.isArray(it) ? it : []; } catch (_) { return []; }
+  };
+  const libBytes = () => libItems().reduce((n, it) => n + Math.floor(((it.b64 || "").length * 3) / 4), 0);
+  const libCap = () => (lib.mode === "archivo" ? 30 : 4) * 1024 * 1024;
+  function refreshCatalog() {
+    catAt = 0;
+    for (const f of [...catListeners]) safe("catalogo listener", f);
+  }
+  function ensureLib() {
+    if (libInit) return libInit;
+    libInit = (async () => {
+      const vs = vendetta.storage;
+      if (vs && typeof vs.createStorage === "function" && typeof vs.createFileBackend === "function") {
+        try {
+          const s = await vs.createStorage(vs.createFileBackend("StickerSenderLibrary.json"));
+          if (s && typeof s === "object") {
+            if (!Array.isArray(s.items)) s.items = [];
+            lib.store = s; lib.mode = "archivo";
+          }
+        } catch (e) { lib.err = String((e && e.message) || e).slice(0, 80); }
+      }
+      if (!lib.store) {
+        const ps = vendetta.plugin.storage;
+        if (!ps.libFallback || !Array.isArray(ps.libFallback.items)) ps.libFallback = { items: [] };
+        lib.store = ps.libFallback; lib.mode = "respaldo";
+      } else {
+        safe("migrar importados", () => { // por si antes se guardaron en el respaldo
+          const fb = vendetta.plugin.storage.libFallback;
+          if (fb && Array.isArray(fb.items) && fb.items.length) {
+            lib.store.items = [...libItems().map((x) => ({ ...x })), ...fb.items.map((x) => ({ ...x }))];
+            vendetta.plugin.storage.libFallback = { items: [] };
+          }
+        });
+      }
+      lib.ready = true;
+      refreshCatalog();
+    })().catch((e) => { lib.err = String((e && e.message) || e).slice(0, 80); libInit = null; });
+    return libInit;
+  }
+  async function addToLib(rec) {
+    await ensureLib();
+    if (!lib.store) throw new Error("no se pudo abrir la biblioteca" + (lib.err ? " (" + lib.err + ")" : ""));
+    const items = libItems();
+    if (items.length >= 200) throw new Error("ya hay 200 importados; borra alguno");
+    if (libBytes() + Math.floor((rec.b64.length * 3) / 4) > libCap())
+      throw new Error("la biblioteca esta llena (" + Math.round(libCap() / 1048576) + " MB); borra alguno");
+    lib.store.items = [...items.map((x) => ({ ...x })), rec];
+  }
+  async function removeFromLib(id) {
+    await ensureLib();
+    if (!lib.store) return;
+    lib.store.items = libItems().filter((x) => x.id !== id).map((x) => ({ ...x }));
+    uriCache.delete(id);
+    refreshCatalog();
+  }
+  async function renameInLib(id, name) {
+    await ensureLib();
+    if (!lib.store) return;
+    lib.store.items = libItems().map((x) => ({ ...x, name: x.id === id ? name : x.name }));
+    refreshCatalog();
+  }
+  const uriCache = new Map();
+  function localUri(it) {
+    let u = uriCache.get(it.id);
+    if (!u) {
+      u = "data:" + (it.mime || (it.ext === "gif" ? "image/gif" : "image/png")) + ";base64," + it.b64;
+      uriCache.set(it.id, u);
+      if (uriCache.size > 80) uriCache.delete(uriCache.keys().next().value);
+    }
+    return u;
+  }
+  const cleanName = (n) => {
+    let s = String(n || "").split("?")[0].split(/[\\/]/).pop();
+    try { s = decodeURIComponent(s); } catch (_) {}
+    s = s.replace(/\.[A-Za-z0-9]{2,5}$/, "").replace(/[^A-Za-z0-9_ À-ɏ-]/g, "").trim().slice(0, 32);
+    return s || "importado";
+  };
+  const fileSafe = (n) => String(n || "").normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 40) || "sticker";
+
+  // Imagen original -> registro de la biblioteca (achicado y recodificado)
+  async function buildLibItem(bytes, fname, kind) {
+    const type = sniffImage(bytes);
+    if (!type) throw new Error("formato no reconocido (usa PNG, GIF, APNG, WebP o JPG)");
+    const target = kind === "emoji" ? size("emojiSize") : size("stickerSize");
+    const id = "L" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    const base = { id, name: cleanName(fname), kind, at: Date.now() };
+    let anim = null, why = "";
+    if (type === "png") {
+      try {
+        if (quickInfo(bytes, "png").animated) {
+          try { anim = await apngFrames(parseApng(bytes), target); } catch (_) { anim = null; } // APNG de 1 cuadro: sigue como PNG normal
+        }
+        if (!anim) { const p = parsePngStatic(bytes); anim = await scaleFrames([{ rgba: p.rgba, cs: 10 }], p.w, p.h, target); }
+      } catch (e) { why = String((e && e.message) || e); anim = null; }
+    } else if (type === "gif") {
+      try { anim = await decodeGif(bytes, target, 90); } catch (e) { why = String((e && e.message) || e); anim = null; }
+    }
+    if (anim) {
+      anim.frames = decimate(anim.frames, 90);
+      const animated = anim.frames.length > 1;
+      const data = animated ? await gifEncode(anim) : pngEncode(anim.w, anim.h, anim.frames[0].rgba);
+      if (data.length > LIB_MAX_ITEM) throw new Error("quedo muy pesado (" + Math.round(data.length / 1024) + " KB); usa una mas corta o mas chica");
+      return { ...base, ext: animated ? "gif" : "png", mime: animated ? "image/gif" : "image/png", raw: false, animated, w: anim.w, h: anim.h, bytes: data.length, b64: b64encode(data) };
+    }
+    // JPG/WebP (o un PNG/GIF raro): no hay decodificador, se guarda tal cual y no se puede achicar
+    if (bytes.length > LIB_MAX_ITEM) throw new Error("pesa " + Math.round(bytes.length / 1024) + " KB y no se puede achicar" + (why ? " (" + why + ")" : "") + "; usa PNG o GIF");
+    const qi = quickInfo(bytes, type);
+    return {
+      ...base, ext: type, mime: { jpg: "image/jpeg", webp: "image/webp", png: "image/png", gif: "image/gif" }[type], raw: true,
+      animated: type === "gif" || !!qi.animated, w: qi.w, h: qi.h, bytes: bytes.length, b64: b64encode(bytes),
+    };
+  }
+
+  // Importado -> bytes listos para subir (con el margen transparente que usan los demas GIF)
+  async function renderLocal(it) {
+    const data = b64decode(it.b64);
+    if (it.raw) return { bytes: data, ext: it.ext, mime: it.mime };
+    let anim;
+    if (it.ext === "gif") anim = await decodeGif(data, 4096, 120);
+    else { const p = parsePngStatic(data); anim = { w: p.w, h: p.h, frames: [{ rgba: p.rgba, cs: 10 }] }; }
+    const k = gifPad();
+    if (k > 1) { // el lienzo mide lo mismo para todos (tamano de sticker x margen): asi cada uno conserva su proporcion
+      const W = Math.max(anim.w, Math.round(size("stickerSize") * k));
+      padFrames(anim, W / anim.w);
+    }
+    return anim.frames.length > 1
+      ? { bytes: await gifEncode(anim), ext: "gif", mime: "image/gif" }
+      : { bytes: pngEncode(anim.w, anim.h, anim.frames[0].rgba), ext: "png", mime: "image/png" };
+  }
+  const localCache = new Map(); // id|tamano|margen -> {bytes, ext, mime} (ultimos 8, 6 MB)
+  async function sendLocalItem(channelId, item) {
+    if (!channelId) channelId = S.SelectedChannelStore?.getChannelId?.();
+    if (!channelId) { toast("No hay canal abierto"); return; }
+    const it = item.lib, bk = channelId + ":" + item.key;
+    if (gifBusy.has(bk)) return; // toque repetido mientras se prepara
+    gifBusy.add(bk);
+    try {
+      const ck = it.id + "|" + size("stickerSize") + "|" + gifPad();
+      let r = localCache.get(ck);
+      if (r) { localCache.delete(ck); localCache.set(ck, r); }
+      else {
+        if (!it.raw && it.animated) toast("Preparando GIF...");
+        r = await renderLocal(it);
+        if (r.bytes.length > 9 * 1024 * 1024) throw new Error("archivo demasiado grande");
+        localCache.set(ck, r);
+        let tot = 0;
+        for (const v of localCache.values()) tot += v.bytes.length;
+        while (localCache.size > 1 && (localCache.size > 8 || tot > 6 * 1024 * 1024)) {
+          const k = localCache.keys().next().value;
+          tot -= localCache.get(k).bytes.length;
+          localCache.delete(k);
+        }
+      }
+      await uploadGif(channelId, r.bytes, fileSafe(it.name) + "." + r.ext, "", r.mime);
+      importState.sent++;
+    } catch (e) {
+      importState.fail++;
+      importState.last = "envio fallo: " + String((e && e.message) || e);
+      toast("No se pudo mandar: " + String((e && e.message) || e).slice(0, 90));
+    } finally {
+      gifBusy.delete(bk);
+    }
+  }
+
+  // ---------- Elegir el archivo ----------
+  // Discord no trae un selector propio documentado: se prueban los que suelen venir incluidos y se usa el primero que exista.
+  const PICK_FNS = ["launchImageLibraryAsync", "launchImageLibrary", "getDocumentAsync", "pickSingle", "pick", "openPicker"];
+  function findPickers() {
+    const out = [], seen = new Set();
+    const add = (label, mod, fn) => {
+      if (mod && (typeof mod === "object" || typeof mod === "function") && typeof mod[fn] === "function" && !seen.has(mod[fn])) { seen.add(mod[fn]); out.push({ label, mod, fn }); }
+    };
+    add("expo-image-picker", safe("p1", () => findByProps("launchImageLibraryAsync")), "launchImageLibraryAsync");
+    add("react-native-image-picker", safe("p2", () => findByProps("launchImageLibrary")), "launchImageLibrary");
+    add("expo-document-picker", safe("p3", () => findByProps("getDocumentAsync")), "getDocumentAsync");
+    add("document-picker", safe("p4", () => findByProps("pickSingle")), "pickSingle");
+    add("document-picker", safe("p5", () => findByProps("pick", "isCancel")), "pick");
+    safe("nativos", () => {
+      const nm = vendetta.metro.common.ReactNative?.NativeModules;
+      if (!nm) return;
+      for (const k of Object.keys(nm)) {
+        if (!/picker|gallery/i.test(k)) continue;
+        const m = safe("nm " + k, () => nm[k]);
+        for (const fn of PICK_FNS) add("nativo:" + k, m, fn);
+      }
+    });
+    return out;
+  }
+  function pickerScan() { // nombres con pinta de selector de galeria, para el reporte
+    const names = new Set();
+    const re = /launchImageLibrary|openPicker|pickSingle|getDocumentAsync|openImagePicker|openMediaPicker|showImagePicker|ImagePicker|DocumentPicker|MediaPicker/;
+    const mods = vendetta.metro.modules ?? globalThis.modules ?? {};
+    for (const id in mods) {
+      try {
+        const m = mods[id];
+        if (!m || m.isInitialized === false) continue;
+        const exp = m.publicModule?.exports;
+        if (!exp) continue;
+        for (const holder of [exp, exp.default]) {
+          if (!holder || (typeof holder !== "object" && typeof holder !== "function")) continue;
+          for (const k of Object.keys(holder)) if (re.test(k)) names.add(k);
+        }
+      } catch (_) {}
+      if (names.size >= 30) break;
+    }
+    const nm = safe("nm", () => Object.keys(vendetta.metro.common.ReactNative.NativeModules).filter((k) => /pick|gallery|document|media|image|file/i.test(k)));
+    return { names: [...names], native: nm || [] };
+  }
+  const isCancelErr = (e) => /cancel|dismiss|abort/i.test(String((e && (e.code || e.message)) || e));
+  async function callPicker(c) {
+    const m = c.mod;
+    if (c.fn === "launchImageLibraryAsync") return m.launchImageLibraryAsync({ allowsEditing: false, quality: 1, allowsMultipleSelection: false });
+    if (c.fn === "launchImageLibrary") {
+      return new Promise((resolve, reject) => {
+        try {
+          const p = m.launchImageLibrary({ mediaType: "photo", selectionLimit: 1, includeBase64: false, quality: 1 }, resolve);
+          if (p && typeof p.then === "function") p.then(resolve, reject);
+        } catch (e) { reject(e); }
+      });
+    }
+    if (c.fn === "getDocumentAsync") return m.getDocumentAsync({ type: "image/*", copyToCacheDirectory: true, multiple: false });
+    if (c.fn === "pickSingle") return m.pickSingle({ type: ["image/*"], copyTo: "cachesDirectory" });
+    if (c.fn === "pick") return m.pick({ type: ["image/*"], copyTo: "cachesDirectory", allowMultiSelection: false });
+    if (c.fn === "openPicker") return m.openPicker({ mediaType: "photo", multiple: false });
+    throw new Error("selector desconocido");
+  }
+  // Resultado de cualquiera de los selectores -> { uri, name, mime } | { cancelled } | null
+  function pickedFile(res) {
+    if (!res) return null;
+    if (res.canceled === true || res.didCancel === true || res.cancelled === true || res.type === "cancel") return { cancelled: true };
+    const a = (res.assets && res.assets[0]) || (Array.isArray(res) ? res[0] : null) || res;
+    const uri = a && (a.fileCopyUri || a.uri || a.path);
+    if (!uri) return null;
+    const u = String(uri);
+    return { uri: /^[a-z]+:\/\//i.test(u) ? u : "file://" + u, name: a.fileName || a.name || u.split("/").pop(), mime: a.mimeType || a.type };
+  }
+  async function pickFromGallery() {
+    const cands = findPickers();
+    importState.pickers = cands.map((c) => c.label + "." + c.fn).join(", ") || "ninguno";
+    if (!cands.length) { const e = new Error("esta version de Discord no expone un selector de galeria"); e.noPicker = true; throw e; }
+    let lastErr = null;
+    for (const c of cands) {
+      try {
+        const f = pickedFile(await callPicker(c));
+        if (f && f.cancelled) return null;
+        if (f) return f;
+        lastErr = new Error("el selector no devolvio ningun archivo");
+      } catch (e) {
+        if (isCancelErr(e)) return null;
+        lastErr = e;
+      }
+    }
+    throw lastErr || new Error("no se pudo abrir la galeria");
+  }
+  // Archivo local (file:// o content://) -> bytes. RN solo deja leerlos como "blob"; de ahi se pasa a base64.
+  function readLocalBytes(uri) {
+    return new Promise((resolve, reject) => {
+      const x = new XMLHttpRequest();
+      x.open("GET", uri);
+      x.responseType = "blob";
+      x.onload = () => {
+        const blob = x.response;
+        if (!blob) return reject(new Error("archivo vacio"));
+        if (blob.size > LIB_MAX_SRC) return reject(new Error("el archivo pesa mas de " + Math.round(LIB_MAX_SRC / 1048576) + " MB"));
+        const fr = new FileReader();
+        fr.onload = () => { const s = String(fr.result || ""); resolve(b64decode(s.slice(s.indexOf(",") + 1))); };
+        fr.onerror = () => reject(new Error("no se pudo leer el archivo"));
+        fr.readAsDataURL(blob);
+      };
+      x.onerror = () => reject(new Error("no se pudo abrir el archivo"));
+      x.send();
+    });
+  }
+
+  // ---------- Dialogos ----------
+  // Pregunta con 1 o 2 opciones + Cancelar (Alert nativo; tocar fuera cancela). Devuelve el indice o -1.
+  function choose(title, message, labels) {
+    return new Promise((resolve) => {
+      const A = vendetta.metro.common.ReactNative?.Alert;
+      if (!A) return resolve(-1);
+      const btns = labels.map((text, i) => ({ text, onPress: () => resolve(i) }));
+      btns.push({ text: "Cancelar", style: "cancel", onPress: () => resolve(-1) });
+      A.alert(title, message, btns, { cancelable: true, onDismiss: () => resolve(-1) });
+    });
+  }
+  // Texto con valor inicial: devuelve el texto, o null si se cancela. Sin cuadro de texto en esta version, usa el valor inicial.
+  function askText(title, initial, placeholder) {
+    return new Promise((resolve) => {
+      const al = vendetta.ui?.alerts;
+      if (!al || typeof al.showInputAlert !== "function") return resolve(initial);
+      try {
+        al.showInputAlert({
+          title, initialValue: initial, placeholder: placeholder || "", confirmText: "Aceptar", cancelText: "Cancelar",
+          onConfirm: (t) => resolve(String(t == null ? "" : t).trim()), onCancel: () => resolve(null),
+        });
+      } catch (_) { resolve(initial); }
+    });
+  }
+  const hasTextInput = () => typeof vendetta.ui?.alerts?.showInputAlert === "function";
+
+  // ---------- Flujo de importar ----------
+  let importBusy = 0;
+  async function startImport(source) {
+    if (importBusy && Date.now() - importBusy < 90000) { toast("Ya hay una importacion en curso"); return; }
+    importBusy = Date.now();
+    try {
+      let src = source;
+      if (!src) {
+        const c = await choose("Importar imagen", "PNG, GIF, APNG, WebP o JPG, como sticker o emoji", ["Galeria", "Link"]);
+        if (c < 0) return;
+        src = c === 0 ? "gallery" : "link";
+      }
+      let bytes, fname;
+      if (src === "gallery") {
+        let f;
+        try { f = await pickFromGallery(); }
+        catch (e) {
+          if (!e.noPicker) throw e;
+          const c = await choose("Sin selector de galeria", "Esta version de Discord no permite abrir la galeria desde el plugin. ¿Importar desde un link?", ["Desde un link"]);
+          if (c < 0) return;
+          src = "link";
+        }
+        if (src === "gallery") {
+          if (!f) return; // cancelado
+          toast("Leyendo archivo...");
+          bytes = await readLocalBytes(f.uri);
+          fname = f.name;
+        }
+      }
+      if (src === "link") {
+        let clip = "";
+        try { clip = String((await vendetta.metro.common.clipboard.getString()) || "").trim(); } catch (_) {}
+        const guess = /^https?:\/\/\S+$/i.test(clip) ? clip : "";
+        let url = hasTextInput() ? await askText("Link de la imagen", guess, "https://...") : guess;
+        if (url == null) return;
+        url = String(url).trim();
+        if (!/^https?:\/\/\S+$/i.test(url)) { toast(hasTextInput() ? "Ese no es un link valido" : "Copia primero el link de la imagen y vuelve a tocar Importar"); return; }
+        toast("Descargando...");
+        bytes = await xhrGetBytes(url);
+        fname = url;
+      }
+      if (bytes.length > LIB_MAX_SRC) throw new Error("el archivo pesa mas de " + Math.round(LIB_MAX_SRC / 1048576) + " MB");
+      const type = sniffImage(bytes);
+      if (!type) throw new Error("no es una imagen PNG, GIF, WebP o JPG");
+      const qi = quickInfo(bytes, type);
+      const desc = type.toUpperCase() + (qi.w ? " " + qi.w + "x" + qi.h : "") + (qi.animated && type !== "gif" ? " animado" : "") + " | " + Math.max(1, Math.round(bytes.length / 1024)) + " KB" +
+        (type === "jpg" || type === "webp" ? "\nNo se puede achicar: se manda con su tamano original" : "");
+      const k = await choose("Importar como...", desc, ["Sticker", "Emoji"]);
+      if (k < 0) return;
+      const kind = k === 0 ? "sticker" : "emoji";
+      const nm = await askText("Nombre", cleanName(fname), "nombre");
+      if (nm == null) return;
+      toast("Procesando...");
+      const rec = await buildLibItem(bytes, nm || fname, kind);
+      await addToLib(rec);
+      importState.ok++;
+      importState.last = "ok " + kind + " " + rec.ext + " " + rec.w + "x" + rec.h + " " + rec.bytes + " bytes";
+      toast("Importado como " + kind + (rec.animated ? " animado" : "") + ": " + rec.name);
+      refreshCatalog();
+    } catch (e) {
+      importState.fail++;
+      importState.last = "fallo: " + String((e && e.message) || e);
+      toast("No se pudo importar: " + String((e && e.message) || e).slice(0, 100));
+    } finally {
+      importBusy = 0;
     }
   }
 
@@ -831,6 +1577,16 @@
       for (const gid of Object.keys(guilds))
         for (const e of S.EmojiStore?.getGuildEmoji?.(gid) ?? [])
           emojis.push({ kind: "emoji", key: "emoji:" + e.id, id: e.id, name: e.name ?? "", n: norm(e.name), animated: !!e.animated, group: gname(gid) });
+    });
+
+    // Importados de la galeria (siempre disponibles; no dependen de la tienda de Discord ni cuentan para "live")
+    safe("importados", () => {
+      for (const it of libItems()) {
+        const isEmoji = it.kind === "emoji";
+        const e = { kind: isEmoji ? "emoji" : "sticker", key: "local:" + it.id, id: it.id, name: it.name ?? "", n: norm(it.name), group: "Importados", local: true, lib: it, animated: !!it.animated };
+        if (!isEmoji) e.tag = it.animated ? (it.ext === "gif" ? "GIF" : String(it.ext).toUpperCase()) : "";
+        (isEmoji ? emojis : stickers).push(e);
+      }
     });
 
     // La tienda de stickers de Discord a veces tarda en llenarse (al abrir la app o al volver de segundo plano).
@@ -879,6 +1635,16 @@
     if (force === true || !catCache || Date.now() - catAt > ttl) { catCache = buildCatalogRaw(); catAt = Date.now(); }
     return catCache;
   }
+  // Revision barata: ¿la tienda de Discord ya tiene stickers de servidores? (sin armar el catalogo)
+  function storeHasStickers() {
+    return !!safe("tienda?", () => {
+      const m = S.StickersStore?.getAllGuildStickers?.();
+      if (!m) return false;
+      if (m instanceof Map) { for (const a of m.values()) if (a && a.length) return true; return false; }
+      for (const k of Object.keys(m)) if (m[k] && m[k].length) return true;
+      return false;
+    });
+  }
   // El selector abierto se entera cuando los stickers terminan de cargar y se actualiza solo
   const catListeners = new Set();
   let notifyT = null;
@@ -908,6 +1674,13 @@
   function pickItem(item, channelId) {
     const now = Date.now();
     if (lastPick.key === item.key && now - lastPick.at < 700) return; // doble toque
+    if (item.local) { // importado de la galeria: se manda como archivo
+      lastPick = { key: item.key, at: now };
+      if (!cfg("keepOpen")) closePicker();
+      pushRecent(item.key);
+      sendLocalItem(channelId, item);
+      return;
+    }
     const url = item.kind === "sticker" ? stickerUrl(item.raw) : emojiUrl(item.id, item.animated);
     if (!url) { toast("Ese sticker no se puede mandar como imagen"); return; }
     lastPick = { key: item.key, at: now };
@@ -947,11 +1720,30 @@
   }
 
   // ---------- Selector (hoja inferior) ----------
+  let CellC = null;
+  function getCell(React, RN) {
+    if (CellC) return CellC;
+    const h = React.createElement;
+    CellC = React.memo(function Cell(p) {
+      const item = p.item;
+      return h(RN.Pressable, {
+        onPress: () => pickItem(item, p.channelId),
+        onLongPress: () => { toast(toggleFav(item.key) ? "Agregado a favoritos" : "Quitado de favoritos"); p.bump(); },
+        style: { width: 100 / p.cols + "%", alignItems: "center", padding: 4 },
+      },
+        h(RN.Image, { source: { uri: previewUrl(item) }, style: { width: p.imgSz, height: p.imgSz }, resizeMode: "contain" }),
+        h(RN.Text, { numberOfLines: 1, style: { color: "#b5bac1", fontSize: 10, marginTop: 2 } }, (p.fav ? "★ " : "") + item.name),
+        item.tag ? h(RN.Text, { style: { color: "#5865f2", fontSize: 9, fontWeight: "bold" } }, item.tag) : null);
+    });
+    return CellC;
+  }
+
   function Picker(props) {
     const { React, ReactNative: RN } = vendetta.metro.common;
     const h = React.createElement;
     const [tab, setTab] = React.useState(props.tab || "sticker");
     const [query, setQuery] = React.useState(props.query || "");
+    const [dq, setDq] = React.useState(props.query || ""); // busqueda con retraso: filtra 150 ms despues de la ultima tecla
     const [group, setGroup] = React.useState("*");
     const [anim, setAnim] = React.useState("all"); // all | anim | static
     const [, bump] = React.useReducer((x) => x + 1, 0);
@@ -961,11 +1753,19 @@
     const [openedAt] = React.useState(Date.now);
     const cat = React.useMemo(() => getCatalog(), [ver]);
     React.useEffect(() => {
-      // Mientras los stickers reales no hayan llegado, vuelve a mirar cada 2 s (hasta 2 min);
-      // ademas se actualiza al instante cuando la tienda de stickers cambia
+      if (dq === query) return;
+      const t = setTimeout(() => setDq(query), 150);
+      return () => clearTimeout(t);
+    }, [query]);
+    React.useEffect(() => {
+      // Mientras los stickers reales no hayan llegado, mira cada 2 s (hasta 2 min) si ya aparecieron; la
+      // revision es barata (solo pregunta a la tienda) y el catalogo solo se rearma cuando hay algo nuevo.
+      // Ademas se actualiza al instante cuando la tienda de stickers cambia
       const f = () => setVer((v) => v + 1);
       catListeners.add(f);
-      const t = setInterval(() => { if (!getCatalog().live && Date.now() - openedAt < 120000) f(); }, 2000);
+      const t = setInterval(() => {
+        if (Date.now() - openedAt < 120000 && !(catCache && catCache.live) && storeHasStickers()) { catAt = 0; f(); }
+      }, 2000);
       return () => { catListeners.delete(f); clearInterval(t); };
     }, []);
     React.useEffect(() => {
@@ -990,11 +1790,8 @@
       const u = getUses();
       return Object.keys(u).filter((k) => u[k] > 0).sort((a, b) => u[b] - u[a]).map((k) => cat.byKey[k]).filter((i) => i && i.kind === tab).slice(0, 48);
     };
-    const base = special
-      ? (group === "@top" ? topList() : getList(group === "@recents" ? "recents" : "favs").map((k) => cat.byKey[k]).filter((i) => i && i.kind === tab))
-      : items.filter((i) => group === "*" || i.group === group);
+    const specialBase = () => (group === "@top" ? topList() : getList(group === "@recents" ? "recents" : "favs").map((k) => cat.byKey[k]).filter((i) => i && i.kind === tab));
     const isAnim = (i) => (i.kind === "sticker" ? !!i.tag : !!i.animated);
-    const byAnim = anim === "all" ? base : base.filter((i) => (anim === "anim" ? isAnim(i) : !isAnim(i)));
     // Busqueda: varias palabras (todas deben coincidir) en el nombre del sticker/emoji o en el del servidor;
     // primero los que coinciden exacto o por el principio del nombre
     const gOf = (i) => i._g || (i._g = norm(i.group));
@@ -1010,9 +1807,18 @@
       }
       return s;
     };
-    const shown = q
-      ? byAnim.map((i, idx) => ({ i, idx, s: score(i) })).filter((x) => x.s > 0).sort((a, b) => b.s - a.s || a.idx - b.idx).map((x) => x.i)
-      : byAnim;
+    const applyFilters = (list) => {
+      const byAnim = anim === "all" ? list : list.filter((i) => (anim === "anim" ? isAnim(i) : !isAnim(i)));
+      return q
+        ? byAnim.map((i, idx) => ({ i, idx, s: score(i) })).filter((x) => x.s > 0).sort((a, b) => b.s - a.s || a.idx - b.idx).map((x) => x.i)
+        : byAnim;
+    };
+    // El filtrado de la lista completa solo se rehace si cambia algo que le afecta (no en cada dibujado);
+    // las listas especiales (favoritos, recientes, mas usados) son chicas y se leen siempre al dia
+    const memoShown = React.useMemo(
+      () => (special ? null : applyFilters(items.filter((i) => group === "*" || i.group === group))),
+      [items, group, anim, q, special]);
+    const shown = special ? applyFilters(specialBase()) : memoShown;
     const cols = [3, 4, 5, 6].includes(Number(cfg("pickerCols"))) ? Number(cfg("pickerCols")) : 4;
     const imgSz = { 3: 84, 4: 64, 5: 54, 6: 46 }[cols];
 
@@ -1029,16 +1835,10 @@
     const boxH = Math.round(RN.Dimensions.get("window").height * 0.6);
     const statusPad = (RN.StatusBar?.currentHeight ?? 28) + 8;
 
+    // Cada celda es un componente memorizado: al escribir o cambiar de pestana solo se redibujan las que cambian
+    const Cell = getCell(React, RN);
     const cell = (item) =>
-      h(RN.Pressable, {
-        key: item.kind + item.id,
-        onPress: () => pickItem(item, props.channelId),
-        onLongPress: () => { toast(toggleFav(item.key) ? "Agregado a favoritos" : "Quitado de favoritos"); bump(); },
-        style: { width: 100 / cols + "%", alignItems: "center", padding: 4 },
-      },
-        h(RN.Image, { source: { uri: previewUrl(item) }, style: { width: imgSz, height: imgSz }, resizeMode: "contain" }),
-        h(RN.Text, { numberOfLines: 1, style: { color: "#b5bac1", fontSize: 10, marginTop: 2 } }, (favSet.has(item.key) ? "\u2605 " : "") + item.name),
-        item.tag ? h(RN.Text, { style: { color: "#5865f2", fontSize: 9, fontWeight: "bold" } }, item.tag) : null);
+      h(Cell, { key: item.kind + item.id, item, fav: favSet.has(item.key), cols, imgSz, channelId: props.channelId, bump });
 
     // Modo de lista: dentro de la hoja nativa, un FlatList normal pelea con el gesto de la hoja y no baja.
     // gh = FlatList de gesture-handler (convive con la hoja) | sheet = la propia hoja hace scroll | rn = normal
@@ -1075,6 +1875,10 @@
           style: { backgroundColor: "#2b2d31", color: "#fff", borderRadius: 8, paddingHorizontal: 12, height: 40, marginBottom: 8 },
         }),
         h(HScroll, { horizontal: true, showsHorizontalScrollIndicator: false, nestedScrollEnabled: true, keyboardShouldPersistTaps: "handled", style: { flexGrow: 0, marginBottom: 8 } },
+          h(RN.Pressable, {
+            key: "@import", onPress: () => startImport(),
+            style: { paddingHorizontal: 12, paddingVertical: 6, borderRadius: 14, marginRight: 6, backgroundColor: "#248046" },
+          }, h(RN.Text, { style: { color: "#fff", fontSize: 13, fontWeight: "bold" } }, "+ Importar")),
           chip("Todos", group === "*", () => setGroup("*"), "*"),
           chip("\u2605 Favoritos", group === "@favs", () => setGroup("@favs"), "@favs"),
           chip("Recientes", group === "@recents", () => setGroup("@recents"), "@recents"),
@@ -1246,6 +2050,11 @@
       "forma de envio usada: " + state.spy.shape + " | intentos fallidos: " + (state.spy.shapeLog || "ninguno") + "\n" +
       "modulos sendMessage: " + (S.msgModules ? S.msgModules.length : 0) + "\n" +
       "ultimo error del selector: " + (state.pickerError || "ninguno") + "\n" +
+      "importados: " + libItems().length + " (" + (lib.mode || "sin abrir") + (lib.err ? ", error: " + lib.err : "") + ") | ok: " + importState.ok + " fallos: " + importState.fail + " enviados: " + importState.sent + "\n" +
+      "ultimo importar: " + (importState.last || "ninguno") + " | selectores usados: " + (importState.pickers || "sin probar") + "\n" +
+      "selectores de galeria disponibles: " + (safe("find", () => findPickers().map((c) => c.label + "." + c.fn).join(", ")) || "ninguno") + "\n" +
+      "nombres de selector en modulos: " + (safe("scan", () => { const s = pickerScan(); return (s.names.join(", ") || "ninguno") + " | nativos: " + (s.native.join(", ") || "ninguno"); }) ?? "error") + "\n" +
+      "storage: createStorage:" + (typeof vendetta.storage?.createStorage) + " createFileBackend:" + (typeof vendetta.storage?.createFileBackend) + " showInputAlert:" + (typeof vendetta.ui?.alerts?.showInputAlert) + "\n" +
       "llamadas a funciones de sticker: " + (JSON.stringify(state.spy.fnCalls) || "{}") + "\n" +
       "ultimo APNG->GIF: " + (gifState.last || "ninguno") + " | ok: " + gifState.ok + " | fallos: " + gifState.fail + "\n" +
       "ultimo contenido enviado: " + (state.spy.lastUrl || "ninguno") + "\n" +
@@ -1281,6 +2090,24 @@
       h(FormSection, { title: "Selector" },
         h(FormRow, { label: "Abrir selector de stickers", subLabel: "Tambien: escribe /sticker en el chat", onPress: () => openPicker({ tab: "sticker" }) }),
         h(FormRow, { label: "Abrir selector de emojis", subLabel: "Tambien: escribe /emoji en el chat", onPress: () => openPicker({ tab: "emoji" }) })),
+      h(FormSection, { title: "Importados" },
+        h(FormRow, { label: "Importar de la galeria", subLabel: "PNG, GIF, APNG, WebP o JPG, como sticker o emoji (animados tambien)", onPress: () => startImport("gallery") }),
+        h(FormRow, { label: "Importar desde un link", subLabel: "Copia el link de una imagen y toca aqui", onPress: () => startImport("link") }),
+        ...libItems().map((it) =>
+          h(FormRow, {
+            key: it.id, label: (it.kind === "emoji" ? "Emoji: " : "Sticker: ") + it.name,
+            subLabel: String(it.ext).toUpperCase() + (it.animated ? " animado" : "") + " | " + (it.w ? it.w + "x" + it.h + " | " : "") + Math.max(1, Math.round((it.bytes || 0) / 1024)) + " KB | toca para borrar" + (hasTextInput() ? " o renombrar" : ""),
+            onPress: async () => {
+              const c = await choose(it.name, "Importado como " + it.kind, hasTextInput() ? ["Borrar", "Renombrar"] : ["Borrar"]);
+              if (c === 0) { await removeFromLib(it.id); toast("Borrado"); force(); }
+              else if (c === 1) { const nm = await askText("Nombre", it.name, "nombre"); if (nm) { await renameInLib(it.id, cleanName(nm)); force(); } }
+            },
+          })),
+        h(FormRow, {
+          label: "Almacenamiento de importados",
+          subLabel: libItems().length + " guardados | " + (libBytes() < 1048576 ? Math.round(libBytes() / 1024) + " KB" : (libBytes() / 1048576).toFixed(1) + " MB") + " de " + Math.round(libCap() / 1048576) + " MB | " + (lib.mode || "abriendo...") + (lib.mode === "respaldo" ? " (esta version no permite archivos propios: limite menor)" : ""),
+          onPress: () => force(),
+        })),
       h(FormSection, { title: "Tamanos (32 a 512)" },
         num("stickerSize", "Sticker (normal: 160)"),
         num("emojiSize", "Emoji (normal: 48)")),
@@ -1365,6 +2192,7 @@
         }
         timers.push(setTimeout(() => safe("precarga", () => getCatalog()), 4000));
       });
+      safe("biblioteca", () => { ensureLib(); }); // abre la biblioteca de importados (en segundo plano)
 
       // 0) Comandos: /sticker [nombre] y /emoji
       safe("comandos", () => {
@@ -1421,7 +2249,18 @@
       // 1) Desbloquear selectores nativos (extra), con reintentos por modulos que cargan tarde
       if (cfg("nativeUnlock")) safe("desbloqueo", () => {
         scanAndPatch();
-        timers.push(setInterval(() => safe("rescan", scanAndPatch), 5000));
+        // Revision periodica de modulos que cargan tarde. Si una pasada no encuentra modulos nuevos, la
+        // siguiente espera el doble (hasta 30 s); si aparecen, vuelve a 5 s. Antes recorria todo cada 5 s siempre.
+        let delay = 5000;
+        const loop = () => {
+          scanTimer = setTimeout(() => {
+            const before = scanned.size;
+            safe("rescan", scanAndPatch);
+            delay = scanned.size === before ? Math.min(delay * 2, 30000) : 5000;
+            loop();
+          }, delay);
+        };
+        loop();
       });
 
       // 2) Stickers bloqueados que llegan por el envio nativo -> link de imagen
@@ -1502,6 +2341,7 @@
     onUnload() {
       for (const t of timers) { clearInterval(t); clearTimeout(t); }
       timers.length = 0;
+      if (scanTimer) { clearTimeout(scanTimer); scanTimer = null; }
       for (const u of unsubs) safe("quitar listener", u);
       unsubs.length = 0;
       if (notifyT) { clearTimeout(notifyT); notifyT = null; }
