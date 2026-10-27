@@ -1357,16 +1357,14 @@
     add("expo-document-picker", safe("p3", () => findByProps("getDocumentAsync")), "getDocumentAsync");
     add("document-picker", safe("p4", () => findByProps("pickSingle")), "pickSingle");
     add("document-picker", safe("p5", () => findByProps("pick", "isCancel")), "pick");
-    safe("nativos", () => {
-      const nm = vendetta.metro.common.ReactNative?.NativeModules;
-      if (!nm) return;
-      for (const k of Object.keys(nm)) {
-        if (!/picker|gallery/i.test(k)) continue;
-        const m = safe("nm " + k, () => nm[k]);
-        for (const fn of PICK_FNS) add("nativo:" + k, m, fn);
-      }
+    // Los modulos nativos desconocidos ya NO se llaman a ciegas (un argumento equivocado cierra la app).
+    // Si la app se cerro justo al abrir un selector, ese selector se descarta para siempre (hasta que lo restablezcas).
+    safe("descartar", () => {
+      const pend = vendetta.plugin.storage.pickPending;
+      if (pend) { setList("pickBad", [...new Set([...getList("pickBad"), pend])]); setList("pickPending", ""); }
     });
-    return out;
+    const bad = getList("pickBad");
+    return out.filter((c) => !bad.includes(c.label + "." + c.fn));
   }
   function pickerScan() { // nombres con pinta de selector de galeria, para el reporte
     const names = new Set();
@@ -1423,7 +1421,10 @@
     let lastErr = null;
     for (const c of cands) {
       try {
-        const f = pickedFile(await callPicker(c));
+        setList("pickPending", c.label + "." + c.fn); // si la app se cierra aqui, al volver se descarta este selector
+        let res;
+        try { res = await callPicker(c); } finally { setList("pickPending", ""); }
+        const f = pickedFile(res);
         if (f && f.cancelled) return null;
         if (f) return f;
         lastErr = new Error("el selector no devolvio ningun archivo");
@@ -2052,7 +2053,8 @@
       "ultimo error del selector: " + (state.pickerError || "ninguno") + "\n" +
       "importados: " + libItems().length + " (" + (lib.mode || "sin abrir") + (lib.err ? ", error: " + lib.err : "") + ") | ok: " + importState.ok + " fallos: " + importState.fail + " enviados: " + importState.sent + "\n" +
       "ultimo importar: " + (importState.last || "ninguno") + " | selectores usados: " + (importState.pickers || "sin probar") + "\n" +
-      "selectores de galeria disponibles: " + (safe("find", () => findPickers().map((c) => c.label + "." + c.fn).join(", ")) || "ninguno") + "\n" +
+      "selectores descartados por cerrar la app: " + (getList("pickBad").join(", ") || "ninguno") + "\n" +
+      "selectores de galeria disponibles: " +(safe("find", () => findPickers().map((c) => c.label + "." + c.fn).join(", ")) || "ninguno") + "\n" +
       "nombres de selector en modulos: " + (safe("scan", () => { const s = pickerScan(); return (s.names.join(", ") || "ninguno") + " | nativos: " + (s.native.join(", ") || "ninguno"); }) ?? "error") + "\n" +
       "storage: createStorage:" + (typeof vendetta.storage?.createStorage) + " createFileBackend:" + (typeof vendetta.storage?.createFileBackend) + " showInputAlert:" + (typeof vendetta.ui?.alerts?.showInputAlert) + "\n" +
       "llamadas a funciones de sticker: " + (JSON.stringify(state.spy.fnCalls) || "{}") + "\n" +
@@ -2093,6 +2095,11 @@
       h(FormSection, { title: "Importados" },
         h(FormRow, { label: "Importar de la galeria", subLabel: "PNG, GIF, APNG, WebP o JPG, como sticker o emoji (animados tambien)", onPress: () => startImport("gallery") }),
         h(FormRow, { label: "Importar desde un link", subLabel: "Copia el link de una imagen y toca aqui", onPress: () => startImport("link") }),
+        getList("pickBad").length ? h(FormRow, {
+          label: "Selectores de galeria descartados",
+          subLabel: getList("pickBad").join(", ") + " (cerraron la app; toca para volver a probarlos)",
+          onPress: () => { setList("pickBad", []); force(); toast("Se volveran a probar"); },
+        }) : null,
         ...libItems().map((it) =>
           h(FormRow, {
             key: it.id, label: (it.kind === "emoji" ? "Emoji: " : "Sticker: ") + it.name,
