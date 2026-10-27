@@ -1883,20 +1883,54 @@
       A.alert(title, message, btns, { cancelable: true, onDismiss: () => resolve(-1) });
     });
   }
-  // Texto con valor inicial: devuelve el texto, o null si se cancela. Sin cuadro de texto en esta version, usa el valor inicial.
+  // Texto con valor inicial: devuelve el texto, o null si se cancela.
+  // CUADRO DE TEXTO PROPIO (dentro del ActionSheet de Discord). Ya NO usa vendetta.ui.alerts.showInputAlert:
+  // en Discord 348 ese componente busca "FluxContainer(Alert)", que ya no existe, y tumba la app al dibujarse
+  // (el try/catch no lo atrapaba porque el error ocurre despues, dentro del render de React).
+  const INPUT_KEY = "StickerSenderInput";
   function askText(title, initial, placeholder) {
     return new Promise((resolve) => {
-      const al = vendetta.ui?.alerts;
-      if (!al || typeof al.showInputAlert !== "function") return resolve(initial);
+      let done = false;
+      const finish = (v) => { if (done) return; done = true; resolve(v); };
+      const AS = S.ActionSheet;
+      if (!AS || typeof AS.openLazy !== "function") return resolve(initial); // sin hoja: se usa el valor propuesto
       try {
-        al.showInputAlert({
-          title, initialValue: initial, placeholder: placeholder || "", confirmText: "Aceptar", cancelText: "Cancelar",
-          onConfirm: (t) => resolve(String(t == null ? "" : t).trim()), onCancel: () => resolve(null),
-        });
-      } catch (_) { resolve(initial); }
+        const { React, ReactNative: RN } = vendetta.metro.common;
+        const h = React.createElement;
+        const okComp = (c) => c && (typeof c === "function" || (typeof c === "object" && c.$$typeof));
+        const NS = okComp(S.NativeSheet) ? S.NativeSheet : safe("hoja input", () => findByProps("ActionSheet")?.ActionSheet);
+        const closeInput = () => safe("cerrar input", () => AS.hideActionSheet?.(INPUT_KEY));
+        const Input = () => {
+          const [text, setText] = React.useState(String(initial == null ? "" : initial));
+          // si la hoja se cierra de cualquier forma (tocar fuera, deslizar, atras) sin aceptar, cuenta como cancelar
+          React.useEffect(() => () => finish(null), []);
+          const ok = () => { finish(String(text).trim()); closeInput(); };
+          const cancel = () => { finish(null); closeInput(); };
+          const btn = (label, color, onPress) =>
+            h(RN.Pressable, { onPress, style: { flex: 1, height: 44, borderRadius: 8, alignItems: "center", justifyContent: "center", backgroundColor: color } },
+              h(RN.Text, { style: { color: "#fff", fontWeight: "bold", fontSize: 15 } }, label));
+          const body = h(RN.View, { style: { padding: 16, paddingBottom: 24 } },
+            h(RN.Text, { style: { color: "#fff", fontSize: 18, fontWeight: "bold", marginBottom: 12 } }, String(title || "")),
+            h(RN.TextInput, {
+              value: text, onChangeText: setText, placeholder: placeholder || "", placeholderTextColor: "#80848e",
+              autoFocus: true, autoCorrect: false, autoCapitalize: "none", returnKeyType: "done", onSubmitEditing: ok,
+              style: { backgroundColor: "#2b2d31", color: "#fff", borderRadius: 8, paddingHorizontal: 12, height: 44, marginBottom: 12 },
+            }),
+            h(RN.View, { style: { flexDirection: "row", gap: 8 } }, btn("Cancelar", "#4e5058", cancel), btn("Aceptar", "#5865f2", ok)));
+          return NS ? h(NS, null, body) : h(RN.View, { style: { backgroundColor: "#1e1f22", borderTopLeftRadius: 16, borderTopRightRadius: 16 } }, body);
+        };
+        const comp = () => {
+          const B = getBoundary(React, RN);
+          return B ? h(B, null, h(Input)) : h(Input);
+        };
+        AS.openLazy(Promise.resolve({ default: comp }), INPUT_KEY, {});
+      } catch (e) {
+        console.error(TAG, "cuadro de texto fallo:", e);
+        finish(initial);
+      }
     });
   }
-  const hasTextInput = () => typeof vendetta.ui?.alerts?.showInputAlert === "function";
+  const hasTextInput = () => typeof S.ActionSheet?.openLazy === "function";
 
   // ---------- Flujo de importar ----------
   let importBusy = 0;

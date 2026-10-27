@@ -1,14 +1,14 @@
 {
   "name": "StickerSender",
-  "description": "Selector propio de stickers y emojis (/sticker, /emoji): los manda como imagen con tamaño normal.",
+  "description": "Manda stickers y emojis de todos tus servidores sin Nitro, e importa los tuyos desde la galeria o un link.",
   "authors": [
     {
-      "name": "Tu nombre"
+      "name": "TuNombre"
     }
   ],
   "main": "index.js",
-  "hash": "0470b743d2c4ebf4821d8779849f2775122a86753dba3f7af5e61df32e91e8f1",
+  "hash": "cfbf861b71dcb2e51d12eecc3331a426430fd4de2cbe88f6500d15f2ffee6994",
   "vendetta": {
-    "icon": "ic_image"
+    "icon": "ic_sticker"
   }
 }
