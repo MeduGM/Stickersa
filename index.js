@@ -105,7 +105,12 @@
   }
   // Vista previa del selector: animada (GIF/APNG) si "animatedPreview" esta activo
   const previewUrl = (it) => {
-    if (it.local) return localUri(it.lib); // importado de la galeria: la imagen va dentro del propio plugin
+    if (it.local) { // importado de la galeria: la imagen va dentro del propio plugin
+      const L = it.lib;
+      // un importado viejo guardado sin achicar (foto grande) tumba la app al dibujarse: se muestra un bloque gris (borralo y vuelve a importarlo)
+      if (L.raw && ((L.bytes || 0) > 400 * 1024 || (L.w || 0) * (L.h || 0) > 1.2e6)) return "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGOIior6DwAELgIOn9bg+wAAAABJRU5ErkJggg==";
+      return localUri(L);
+    }
     if (it.kind === "sticker") {
       if (cfg("animatedPreview") && it.raw && fmt(it.raw) !== 3) {
         const u = stickerUrl(it.raw, 96);
@@ -1170,6 +1175,344 @@
     return out;
   }
 
+  // ---------- JPEG (lectura) ----------
+  // Decodificador propio en JS puro (baseline y progresivo). Si la foto es grande solo se decodifica el valor medio de
+  // cada bloque de 8x8 (la imagen a 1/8), que es justo lo que hace falta para un sticker y casi no gasta memoria.
+  const JZZ = new Uint8Array([0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63]);
+  let JIDCT = null;
+  function jpgHuff(counts, vals) {
+    const look = new Int16Array(256), maxcode = new Int32Array(18), mincode = new Int32Array(18), valptr = new Int32Array(18);
+    let code = 0, k = 0;
+    for (let l = 1; l <= 16; l++) {
+      const cnt = counts[l - 1];
+      valptr[l] = k; mincode[l] = code; maxcode[l] = cnt ? code + cnt - 1 : -1;
+      for (let i = 0; i < cnt; i++) {
+        if (l <= 8) { const base = code << (8 - l); for (let j = 0, m = 1 << (8 - l); j < m; j++) look[base + j] = (l << 8) | vals[k]; }
+        code++; k++;
+      }
+      code <<= 1;
+    }
+    return { look, maxcode, mincode, valptr, vals };
+  }
+  // Orientacion EXIF (1 a 8) del APP1; 1 si no hay
+  function jpgExifOrient(b, s, e) {
+    try {
+      if (!(b[s] === 69 && b[s + 1] === 120 && b[s + 2] === 105 && b[s + 3] === 102)) return 1; // "Exif"
+      const t = s + 6, le = b[t] === 73;
+      const u16 = (o) => (le ? b[o] | (b[o + 1] << 8) : (b[o] << 8) | b[o + 1]);
+      const u32 = (o) => (le ? (b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24)) >>> 0 : ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0);
+      let ifd = t + u32(t + 4);
+      const cnt = u16(ifd);
+      for (let i = 0; i < cnt && ifd + 14 + i * 12 <= e; i++) {
+        const o = ifd + 2 + i * 12;
+        if (u16(o) === 0x0112) { const v = u16(o + 8); return v >= 1 && v <= 8 ? v : 1; }
+      }
+    } catch (_) {}
+    return 1;
+  }
+  // Gira/voltea un RGBA segun la orientacion EXIF
+  function orientRGBA(rgba, w, h, o) {
+    if (!o || o === 1) return { rgba, w, h };
+    const swap = o >= 5, nw = swap ? h : w, nh = swap ? w : h;
+    const out = new Uint8Array(nw * nh * 4);
+    for (let y = 0; y < nh; y++) {
+      for (let x = 0; x < nw; x++) {
+        let sx, sy;
+        switch (o) {
+          case 2: sx = w - 1 - x; sy = y; break;
+          case 3: sx = w - 1 - x; sy = h - 1 - y; break;
+          case 4: sx = x; sy = h - 1 - y; break;
+          case 5: sx = y; sy = x; break;
+          case 6: sx = y; sy = h - 1 - x; break;
+          case 7: sx = w - 1 - y; sy = h - 1 - x; break;
+          default: sx = w - 1 - y; sy = x; // 8
+        }
+        const si = (sy * w + sx) * 4, di = (y * nw + x) * 4;
+        out[di] = rgba[si]; out[di + 1] = rgba[si + 1]; out[di + 2] = rgba[si + 2]; out[di + 3] = rgba[si + 3];
+      }
+    }
+    return { rgba: out, w: nw, h: nh };
+  }
+
+  // JPG -> { w, h, rgba, orient }. "target" = tamano final aproximado (decide si basta con 1/8 de la imagen)
+  async function decodeJpeg(b, target) {
+    const n = b.length;
+    if (n < 4 || b[0] !== 0xff || b[1] !== 0xd8) throw new Error("no es un JPG");
+    const qts = [], dcT = [], acT = [];
+    let frame = null, ri = 0, adobe = -1, orient = 1, dcOnly = false;
+    let p = 2;
+    const findMarker = (q) => { // siguiente marcador de verdad (no RSTn ni relleno) a partir de q
+      while (q < n - 1) {
+        if (b[q] === 0xff) { const m = b[q + 1]; if (m !== 0 && m !== 0xff && !(m >= 0xd0 && m <= 0xd7)) return q; }
+        q++;
+      }
+      return n;
+    };
+    while (p < n - 3) {
+      if (b[p] !== 0xff) { p++; continue; }
+      const m = b[p + 1];
+      if (m === 0xff) { p++; continue; }
+      if (m === 0 || m === 1 || (m >= 0xd0 && m <= 0xd8)) { p += 2; continue; }
+      if (m === 0xd9) break;
+      const len = (b[p + 2] << 8) | b[p + 3];
+      const s = p + 4, e = Math.min(n, p + 2 + len);
+      if (m === 0xe1 && orient === 1) orient = jpgExifOrient(b, s, e);
+      else if (m === 0xee && b[s] === 65 && b[s + 1] === 100 && b[s + 2] === 111 && b[s + 3] === 98 && b[s + 4] === 101) adobe = b[s + 11];
+      else if (m === 0xdb) {
+        for (let q = s; q < e;) {
+          const pq = b[q] >> 4, tq = b[q] & 15; q++;
+          const t = new Int32Array(64);
+          for (let i = 0; i < 64; i++) { t[JZZ[i]] = pq ? (b[q] << 8) | b[q + 1] : b[q]; q += pq ? 2 : 1; }
+          qts[tq] = t;
+        }
+      } else if (m === 0xc4) {
+        for (let q = s; q < e;) {
+          const tc = b[q] >> 4, th = b[q] & 15; q++;
+          const counts = b.subarray(q, q + 16); q += 16;
+          let tot = 0; for (let i = 0; i < 16; i++) tot += counts[i];
+          const vals = b.subarray(q, q + tot); q += tot;
+          (tc ? acT : dcT)[th] = jpgHuff(counts, vals);
+        }
+      } else if (m === 0xdd) ri = (b[s] << 8) | b[s + 1];
+      else if (m === 0xc0 || m === 0xc1 || m === 0xc2) {
+        if (frame) throw new Error("JPG con varios cuadros no soportado");
+        if (b[s] !== 8) throw new Error("JPG de " + b[s] + " bits no soportado");
+        const H = (b[s + 1] << 8) | b[s + 2], W = (b[s + 3] << 8) | b[s + 4], nc = b[s + 5];
+        if (!W || !H) throw new Error("JPG sin tamano");
+        if (W * H > 120e6) throw new Error("JPG demasiado grande (" + W + "x" + H + ")");
+        if (nc !== 1 && nc !== 3) throw new Error(nc === 4 ? "JPG CMYK no soportado" : "JPG con " + nc + " canales no soportado");
+        const comps = [];
+        let maxH = 1, maxV = 1;
+        for (let i = 0; i < nc; i++) {
+          const o = s + 6 + i * 3, hh = b[o + 1] >> 4, vv = b[o + 1] & 15;
+          if (!hh || !vv || hh > 4 || vv > 4) throw new Error("JPG danado (muestreo)");
+          comps.push({ id: b[o], h: hh, v: vv, tq: b[o + 2], pred: 0 });
+          if (hh > maxH) maxH = hh; if (vv > maxV) maxV = vv;
+        }
+        const mpl = Math.ceil(W / (8 * maxH)), mpc = Math.ceil(H / (8 * maxV));
+        dcOnly = Math.max(W, H) / 8 >= target || W * H > 8e6;
+        for (const c of comps) {
+          c.bw = mpl * c.h; c.bh = mpc * c.v;
+          c.rbw = Math.ceil(Math.ceil((W * c.h) / maxH) / 8); c.rbh = Math.ceil(Math.ceil((H * c.v) / maxV) / 8);
+          c.cf = dcOnly ? new Int16Array(c.bw * c.bh) : new Int16Array(c.bw * c.bh * 64);
+        }
+        frame = { W, H, comps, maxH, maxV, mpl, mpc, prog: m === 0xc2 };
+      } else if ((m >= 0xc3 && m <= 0xcf && m !== 0xc4 && m !== 0xc8 && m !== 0xcc)) throw new Error("JPG aritmetico o sin perdida no soportado");
+      else if (m === 0xda) {
+        if (!frame) throw new Error("JPG danado (sin cabecera)");
+        const ns = b[s];
+        const sc = [];
+        for (let i = 0; i < ns; i++) {
+          const c = frame.comps.find((x) => x.id === b[s + 1 + i * 2]);
+          if (!c) throw new Error("JPG danado (componente)");
+          c.dc = dcT[b[s + 2 + i * 2] >> 4]; c.ac = acT[b[s + 2 + i * 2] & 15];
+          sc.push(c);
+        }
+        const Ss = b[s + 1 + ns * 2], Se = b[s + 2 + ns * 2], Ah = b[s + 3 + ns * 2] >> 4, Al = b[s + 3 + ns * 2] & 15;
+        if (dcOnly && frame.prog && Ss > 0) { p = findMarker(e); continue; } // los AC no hacen falta
+        p = jpgScan(b, n, e, frame, sc, ri, Ss, Se, Ah, Al, dcOnly);
+        continue;
+      }
+      p = e;
+    }
+    if (!frame) throw new Error("JPG sin imagen");
+    // ---- reconstruir ----
+    const { W, H, comps, maxH, maxV } = frame;
+    const planes = [];
+    let outW, outH;
+    if (dcOnly) {
+      outW = Math.ceil(W / 8); outH = Math.ceil(H / 8);
+      for (const c of comps) {
+        const q = qts[c.tq]; if (!q) throw new Error("JPG danado (tabla)");
+        const pl = new Uint8Array(c.bw * c.bh);
+        for (let i = 0; i < pl.length; i++) { const v = Math.round((c.cf[i] * q[0]) / 8 + 128); pl[i] = v < 0 ? 0 : v > 255 ? 255 : v; }
+        planes.push({ pl, pw: c.bw, ph: c.bh });
+      }
+    } else {
+      outW = W; outH = H;
+      if (!JIDCT) {
+        JIDCT = new Float32Array(64);
+        for (let x = 0; x < 8; x++) for (let u = 0; u < 8; u++) JIDCT[x * 8 + u] = (u === 0 ? Math.SQRT1_2 : 1) * 0.5 * Math.cos(((2 * x + 1) * u * Math.PI) / 16);
+      }
+      const M = JIDCT, blk = new Float32Array(64), tmp = new Float32Array(64);
+      for (const c of comps) {
+        const q = qts[c.tq]; if (!q) throw new Error("JPG danado (tabla)");
+        const pw = c.bw * 8, ph = c.bh * 8, pl = new Uint8Array(pw * ph), cf = c.cf;
+        for (let by = 0; by < c.bh; by++) {
+          for (let bx = 0; bx < c.bw; bx++) {
+            const o = (by * c.bw + bx) * 64;
+            let nz = false;
+            for (let i = 1; i < 64; i++) if (cf[o + i]) { nz = true; break; }
+            const base = by * 8 * pw + bx * 8;
+            if (!nz) {
+              let v = Math.round((cf[o] * q[0]) / 8 + 128); v = v < 0 ? 0 : v > 255 ? 255 : v;
+              for (let y = 0; y < 8; y++) for (let x = 0; x < 8; x++) pl[base + y * pw + x] = v;
+              continue;
+            }
+            for (let i = 0; i < 64; i++) blk[i] = cf[o + i] * q[i];
+            for (let v = 0; v < 8; v++) for (let x = 0; x < 8; x++) {
+              let sum = 0; for (let u = 0; u < 8; u++) sum += M[x * 8 + u] * blk[v * 8 + u];
+              tmp[v * 8 + x] = sum;
+            }
+            for (let y = 0; y < 8; y++) for (let x = 0; x < 8; x++) {
+              let sum = 0; for (let v = 0; v < 8; v++) sum += M[y * 8 + v] * tmp[v * 8 + x];
+              const r = Math.round(sum + 128);
+              pl[base + y * pw + x] = r < 0 ? 0 : r > 255 ? 255 : r;
+            }
+          }
+          if ((by & 7) === 7) await tick();
+        }
+        planes.push({ pl, pw, ph });
+      }
+    }
+    // ---- a RGBA (con el muestreo de color ajustado) ----
+    const rgba = new Uint8Array(outW * outH * 4);
+    const nc = comps.length;
+    const xm = comps.map((c, i) => { const a = new Int32Array(outW); for (let x = 0; x < outW; x++) a[x] = Math.min(planes[i].pw - 1, Math.floor((x * c.h) / maxH)); return a; });
+    const ycc = nc === 3 && (adobe >= 0 ? adobe !== 0 : !(comps[0].id === 82 && comps[1].id === 71 && comps[2].id === 66));
+    const cl = (v) => (v < 0 ? 0 : v > 255 ? 255 : Math.round(v));
+    for (let y = 0; y < outH; y++) {
+      const rows = comps.map((c, i) => Math.min(planes[i].ph - 1, Math.floor((y * c.v) / maxV)) * planes[i].pw);
+      for (let x = 0; x < outW; x++) {
+        const o = (y * outW + x) * 4;
+        if (nc === 1) { const v = planes[0].pl[rows[0] + xm[0][x]]; rgba[o] = v; rgba[o + 1] = v; rgba[o + 2] = v; }
+        else {
+          const Y = planes[0].pl[rows[0] + xm[0][x]], A = planes[1].pl[rows[1] + xm[1][x]], B = planes[2].pl[rows[2] + xm[2][x]];
+          if (ycc) { rgba[o] = cl(Y + 1.402 * (B - 128)); rgba[o + 1] = cl(Y - 0.344136 * (A - 128) - 0.714136 * (B - 128)); rgba[o + 2] = cl(Y + 1.772 * (A - 128)); }
+          else { rgba[o] = Y; rgba[o + 1] = A; rgba[o + 2] = B; }
+        }
+        rgba[o + 3] = 255;
+      }
+      if ((y & 63) === 63) await tick();
+    }
+    return { w: outW, h: outH, rgba, orient };
+  }
+
+  // Un barrido (scan) del JPG: devuelve la posicion del siguiente marcador
+  function jpgScan(b, n, start, frame, sc, ri, Ss, Se, Ah, Al, dcOnly) {
+    const prog = frame.prog;
+    let pos = start, bb = 0, bc = 0, eobrun = 0;
+    const fill = () => {
+      while (bc <= 24) {
+        let byte = 0;
+        if (pos < n) {
+          byte = b[pos];
+          if (byte === 0xff) {
+            const nx = b[pos + 1];
+            if (nx === 0) pos += 2;
+            else if (nx === 0xff) { pos++; continue; }
+            else byte = 0; // marcador: se rellena con ceros sin avanzar
+          } else pos++;
+        }
+        bb = (bb << 8) | byte; bc += 8;
+      }
+    };
+    const bits = (k) => { if (bc < k) fill(); bc -= k; return (bb >>> bc) & ((1 << k) - 1); };
+    const ext = (v, s) => (v < (1 << (s - 1)) ? v - (1 << s) + 1 : v);
+    const sym = (t) => {
+      if (!t) throw new Error("JPG danado (tabla Huffman)");
+      if (bc < 16) fill();
+      const e = t.look[(bb >>> (bc - 8)) & 255];
+      if (e) { bc -= e >> 8; return e & 255; }
+      for (let l = 9; l <= 16; l++) {
+        const code = (bb >>> (bc - l)) & ((1 << l) - 1);
+        if (code <= t.maxcode[l]) { bc -= l; return t.vals[t.valptr[l] + code - t.mincode[l]]; }
+      }
+      bc -= 16; return 0;
+    };
+    const p1 = 1 << Al, m1 = -1 << Al;
+    const refineNz = (cf, idx) => { if (bits(1) && (cf[idx] & p1) === 0) cf[idx] += cf[idx] >= 0 ? p1 : m1; };
+    function block(c, blk) {
+      const cf = c.cf;
+      if (!prog) {
+        const t = sym(c.dc);
+        c.pred += t ? ext(bits(t), t) : 0;
+        if (dcOnly) {
+          cf[blk] = c.pred;
+          for (let k = 1; k < 64; k++) { const rs = sym(c.ac), s = rs & 15; if (s === 0) { if ((rs >> 4) < 15) break; k += 15; } else { k += rs >> 4; bits(s); } }
+          return;
+        }
+        const o = blk * 64;
+        cf[o] = c.pred;
+        for (let k = 1; k < 64; k++) {
+          const rs = sym(c.ac), s = rs & 15;
+          if (s === 0) { if ((rs >> 4) < 15) break; k += 15; }
+          else { k += rs >> 4; if (k > 63) break; cf[o + JZZ[k]] = ext(bits(s), s); }
+        }
+        return;
+      }
+      if (Ss === 0) { // DC
+        const o = dcOnly ? blk : blk * 64;
+        if (Ah === 0) { const t = sym(c.dc); c.pred += t ? ext(bits(t), t) : 0; cf[o] = c.pred << Al; }
+        else if (bits(1)) cf[o] |= p1;
+        return;
+      }
+      const o = blk * 64;
+      if (Ah === 0) { // AC, primera pasada
+        if (eobrun > 0) { eobrun--; return; }
+        for (let k = Ss; k <= Se; k++) {
+          const rs = sym(c.ac), s = rs & 15, r = rs >> 4;
+          if (s) { k += r; if (k > 63) break; cf[o + JZZ[k]] = ext(bits(s), s) * (1 << Al); }
+          else if (r === 15) k += 15;
+          else { eobrun = (1 << r) - 1 + (r ? bits(r) : 0); break; }
+        }
+        return;
+      }
+      // AC, pasadas de refinamiento
+      let k = Ss;
+      if (eobrun === 0) {
+        for (; k <= Se; k++) {
+          const rs = sym(c.ac);
+          let s = rs & 15, r = rs >> 4;
+          if (s) s = bits(1) ? p1 : m1;
+          else if (r !== 15) { eobrun = (1 << r) + (r ? bits(r) : 0); break; }
+          do {
+            const idx = o + JZZ[k];
+            if (cf[idx] !== 0) refineNz(cf, idx);
+            else if (--r < 0) break;
+            k++;
+          } while (k <= Se);
+          if (s && k <= 63) cf[o + JZZ[k]] = s;
+        }
+      }
+      if (eobrun > 0) {
+        for (; k <= Se; k++) { const idx = o + JZZ[k]; if (cf[idx] !== 0) refineNz(cf, idx); }
+        eobrun--;
+      }
+    }
+    // unidades del barrido: bloques sueltos (1 componente) o MCU completos (varios)
+    let total, perLine;
+    if (sc.length === 1) { perLine = sc[0].rbw; total = sc[0].rbw * sc[0].rbh; }
+    else { perLine = frame.mpl; total = frame.mpl * frame.mpc; }
+    let cnt = 0;
+    for (let u = 0; u < total; u++) {
+      if (ri && cnt === ri) { // reinicio: alinear, saltar RSTn y volver a empezar las predicciones
+        bb = 0; bc = 0; eobrun = 0; cnt = 0;
+        let q = pos;
+        while (q < n - 1 && !(b[q] === 0xff && b[q + 1] >= 0xd0 && b[q + 1] <= 0xd7)) { if (b[q] === 0xff && b[q + 1] !== 0 && b[q + 1] !== 0xff) break; q++; }
+        if (b[q] === 0xff && b[q + 1] >= 0xd0 && b[q + 1] <= 0xd7) q += 2;
+        pos = q;
+        for (const c of sc) c.pred = 0;
+      }
+      if (u === 0) for (const c of sc) c.pred = 0;
+      if (sc.length === 1) {
+        const c = sc[0], row = (u / perLine) | 0, col = u % perLine;
+        block(c, row * c.bw + col);
+      } else {
+        const mr = (u / perLine) | 0, mc = u % perLine;
+        for (const c of sc) for (let v = 0; v < c.v; v++) for (let h = 0; h < c.h; h++) block(c, (mr * c.v + v) * c.bw + mc * c.h + h);
+      }
+      cnt++;
+    }
+    // siguiente marcador
+    let q = pos;
+    while (q < n - 1) {
+      if (b[q] === 0xff) { const m = b[q + 1]; if (m !== 0 && m !== 0xff && !(m >= 0xd0 && m <= 0xd7)) return q; }
+      q++;
+    }
+    return n;
+  }
+
   // ---------- Biblioteca de importados ----------
   // Cada importado se guarda ya achicado (PNG si es estatico, GIF si es animado) y se manda como archivo,
   // igual que los APNG convertidos. Se guarda en un archivo propio (para no hinchar los ajustes del plugin);
@@ -1276,6 +1619,15 @@
       } catch (e) { why = String((e && e.message) || e); anim = null; }
     } else if (type === "gif") {
       try { anim = await decodeGif(bytes, target, 90); } catch (e) { why = String((e && e.message) || e); anim = null; }
+    } else if (type === "jpg") { // JPG: se decodifica, se achica a tamano sticker y se guarda como PNG (igual que un PNG)
+      try {
+        const j = await decodeJpeg(bytes, target);
+        anim = await scaleFrames([{ rgba: j.rgba, cs: 10 }], j.w, j.h, target);
+        if (j.orient > 1) { // fotos del celular: respetar la rotacion guardada en el archivo
+          const o = orientRGBA(anim.frames[0].rgba, anim.w, anim.h, j.orient);
+          anim = { w: o.w, h: o.h, frames: [{ rgba: o.rgba, cs: 10 }] };
+        }
+      } catch (e) { why = String((e && e.message) || e); anim = null; }
     }
     if (anim) {
       anim.frames = decimate(anim.frames, 90);
@@ -1284,7 +1636,13 @@
       if (data.length > LIB_MAX_ITEM) throw new Error("quedo muy pesado (" + Math.round(data.length / 1024) + " KB); usa una mas corta o mas chica");
       return { ...base, ext: animated ? "gif" : "png", mime: animated ? "image/gif" : "image/png", raw: false, animated, w: anim.w, h: anim.h, bytes: data.length, b64: b64encode(data) };
     }
-    // JPG/WebP (o un PNG/GIF raro): no hay decodificador, se guarda tal cual y no se puede achicar
+    // WebP (o un JPG/PNG/GIF raro que no se pudo leer): no se puede achicar, se guarda tal cual SOLO si es chico.
+    // Una imagen grande guardada asi hacia que la app se cerrara al dibujar la vista previa.
+    {
+      const q0 = quickInfo(bytes, type), px = q0.w * q0.h;
+      if (type === "jpg" || type === "png" || type === "gif" ? !(bytes.length <= 300 * 1024 && px > 0 && px <= 360000) : px > 2e6)
+        throw new Error("no se pudo achicar " + (type === "webp" ? "(WebP muy grande en pixeles)" : "(" + (why || "formato raro") + ")") + "; pasala a PNG o GIF mas chico");
+    }
     if (bytes.length > LIB_MAX_ITEM) throw new Error("pesa " + Math.round(bytes.length / 1024) + " KB y no se puede achicar" + (why ? " (" + why + ")" : "") + "; usa PNG o GIF");
     const qi = quickInfo(bytes, type);
     return {
@@ -1595,7 +1953,7 @@
       if (!type) throw new Error("no es una imagen PNG, GIF, WebP o JPG");
       const qi = quickInfo(bytes, type);
       const desc = type.toUpperCase() + (qi.w ? " " + qi.w + "x" + qi.h : "") + (qi.animated && type !== "gif" ? " animado" : "") + " | " + Math.max(1, Math.round(bytes.length / 1024)) + " KB" +
-        (type === "jpg" || type === "webp" ? "\nNo se puede achicar: se manda con su tamano original" : "");
+        (type === "webp" ? "\nNo se puede achicar: se manda con su tamano original" : "");
       const k = await choose("Importar como...", desc, ["Sticker", "Emoji"]);
       if (k < 0) return;
       const kind = k === 0 ? "sticker" : "emoji";
@@ -2103,7 +2461,7 @@
   function reportText() {
     const r = state.report;
     return (
-      "StickerSender v2.10\n" +
+      "StickerSender v2.11\n" +
       "parcheados: " + (r.patched.join(", ") || "ninguno") + "\n" +
       "no encontrados: " + (r.missing.join(", ") || "ninguno") + "\n" +
       "nombres parecidos: " + (r.similar.slice(0, 60).join(", ") || "ninguno") + "\n" +
