@@ -1775,7 +1775,7 @@
   async function deepFindPickers() {
     settlePickCrash(); // primero se resuelve lo de la vez anterior; despues se pone el marcador nuevo
     if (deepScanBad()) return [];
-    toast("Buscando selector... si la app se cierra, esta busqueda se desactiva sola");
+    toast("Buscando el selector de galeria...");
     setList("scanPending", "1");
     await sleep(400); // tiempo para que el marcador llegue al disco
     let res = [];
@@ -1805,48 +1805,71 @@
   const isCancelErr = (e) => /cancel|dismiss|abort/i.test(String((e && (e.code || e.message)) || e));
   async function callPicker(c) {
     const m = c.mod;
-    if (c.fn === "launchImageLibraryAsync") return m.launchImageLibraryAsync({ allowsEditing: false, quality: 1, allowsMultipleSelection: false });
+    if (c.fn === "launchImageLibraryAsync") return m.launchImageLibraryAsync({ allowsEditing: false, quality: 1, allowsMultipleSelection: true, selectionLimit: MAX_BATCH });
     if (c.fn === "launchImageLibrary") {
       return new Promise((resolve, reject) => {
         try {
-          const p = m.launchImageLibrary({ mediaType: "photo", selectionLimit: 1, includeBase64: false, quality: 1 }, resolve);
+          const p = m.launchImageLibrary({ mediaType: "photo", selectionLimit: MAX_BATCH, includeBase64: false, quality: 1 }, resolve);
           if (p && typeof p.then === "function") p.then(resolve, reject);
         } catch (e) { reject(e); }
       });
     }
-    if (c.fn === "getDocumentAsync") return m.getDocumentAsync({ type: "image/*", copyToCacheDirectory: true, multiple: false });
+    if (c.fn === "getDocumentAsync") return m.getDocumentAsync({ type: "image/*", copyToCacheDirectory: true, multiple: true });
     if (c.fn === "pickSingle") return m.pickSingle({ type: ["image/*"], copyTo: "cachesDirectory" });
-    if (c.fn === "pick") return m.pick({ type: ["image/*"], copyTo: "cachesDirectory", allowMultiSelection: false });
+    if (c.fn === "pick") return m.pick({ type: ["image/*"], copyTo: "cachesDirectory", allowMultiSelection: true });
     if (c.fn === "openPicker") return m.openPicker({ mediaType: "photo", multiple: false });
     throw new Error("selector desconocido");
   }
-  // Resultado de cualquiera de los selectores -> { uri, name, mime } | { cancelled } | null
-  function pickedFile(res) {
+  // Resultado de cualquiera de los selectores -> [{ uri, name, mime }, ...] | { cancelled } | null
+  const MAX_BATCH = 10; // maximo de imagenes por importacion
+  function pickedFiles(res) {
     if (!res) return null;
     if (res.canceled === true || res.didCancel === true || res.cancelled === true || res.type === "cancel") return { cancelled: true };
-    const a = (res.assets && res.assets[0]) || (Array.isArray(res) ? res[0] : null) || res;
-    const uri = a && (a.fileCopyUri || a.uri || a.path);
-    if (!uri) return null;
-    const u = String(uri);
-    return { uri: /^[a-z]+:\/\//i.test(u) ? u : "file://" + u, name: a.fileName || a.name || u.split("/").pop(), mime: a.mimeType || a.type };
+    const list = res.assets && res.assets.length ? res.assets : Array.isArray(res) ? res : [res];
+    const out = [];
+    for (const a of list) {
+      if (out.length >= MAX_BATCH) break;
+      const uri = a && (a.fileCopyUri || a.uri || a.path);
+      if (!uri) continue;
+      const u = String(uri);
+      out.push({ uri: /^[a-z]+:\/\//i.test(u) ? u : "file://" + u, name: a.fileName || a.name || u.split("/").pop(), mime: a.mimeType || a.type });
+    }
+    return out.length ? out : null;
   }
-  async function pickFromGallery(deep) {
-    const cands = deep ? await deepFindPickers() : findPickers();
+  // Selectores ya encontrados en esta sesion (para no volver a buscarlos) y los que ya funcionaron (sin marcador previo)
+  let pickerCache = null;
+  const pickerOk = new Set();
+  async function getPickers() {
+    settlePickCrash();
+    const bad = getList("pickBad");
+    if (pickerCache) {
+      const c = pickerCache.filter((x) => !bad.includes(x.label + "." + x.fn));
+      if (c.length) return c;
+      pickerCache = null;
+    }
+    let c = collectPickers(false);
+    if (!c.length) c = await deepFindPickers(); // automatico: solo si no hay ninguno ya cargado (y se desactiva solo si cierra la app)
+    if (c.length) pickerCache = c;
+    return c;
+  }
+  async function pickFromGallery() {
+    const cands = await getPickers();
     importState.pickers = cands.map((c) => c.label + "." + c.fn).join(", ") || "ninguno";
     if (!cands.length) { const e = new Error("esta version de Discord no expone un selector de galeria"); e.noPicker = true; throw e; }
     let lastErr = null;
     for (const c of cands) {
+      const id = c.label + "." + c.fn;
+      const first = !pickerOk.has(id);
       try {
-        setList("pickPending", c.label + "." + c.fn); // si la app se cierra aqui, al volver se descarta este selector
-        await sleep(350); // da tiempo a que el marcador se escriba antes de entrar al codigo nativo
+        if (first) { setList("pickPending", id); await sleep(350); } // si la app se cierra aqui, al volver se descarta este selector
         let res;
-        try { res = await callPicker(c); } finally { setList("pickPending", ""); }
-        const f = pickedFile(res);
-        if (f && f.cancelled) return null;
-        if (f) return f;
+        try { res = await callPicker(c); } finally { if (first) setList("pickPending", ""); }
+        const f = pickedFiles(res);
+        if (f && f.cancelled) { pickerOk.add(id); return null; }
+        if (f) { pickerOk.add(id); return f; }
         lastErr = new Error("el selector no devolvio ningun archivo");
       } catch (e) {
-        if (isCancelErr(e)) return null;
+        if (isCancelErr(e)) { pickerOk.add(id); return null; }
         lastErr = e;
       }
     }
@@ -1884,90 +1907,130 @@
     });
   }
   // Texto con valor inicial: devuelve el texto, o null si se cancela.
-  // CUADRO DE TEXTO PROPIO (dentro del ActionSheet de Discord). Ya NO usa vendetta.ui.alerts.showInputAlert:
-  // en Discord 348 ese componente busca "FluxContainer(Alert)", que ya no existe, y tumba la app al dibujarse
-  // (el try/catch no lo atrapaba porque el error ocurre despues, dentro del render de React).
+  // HOJA DE FORMULARIO PROPIA (dentro del ActionSheet de Discord). No usa vendetta.ui.alerts.showInputAlert:
+  // en Discord 348 ese componente busca "FluxContainer(Alert)", que ya no existe, y tumba la app al dibujarse.
   const INPUT_KEY = "StickerSenderInput";
-  function askText(title, initial, placeholder) {
+  // o: { title, info?, input?: { initial, placeholder }, actions: [{ label, color, value }], submit? }
+  // Devuelve { value, text } al tocar un boton con valor, null si se cancela o se cierra la hoja,
+  // o undefined si no hay hoja disponible.
+  function sheetPrompt(o) {
     return new Promise((resolve) => {
       let done = false;
       const finish = (v) => { if (done) return; done = true; resolve(v); };
       const AS = S.ActionSheet;
-      if (!AS || typeof AS.openLazy !== "function") return resolve(initial); // sin hoja: se usa el valor propuesto
+      if (!AS || typeof AS.openLazy !== "function") return resolve(undefined);
       try {
         const { React, ReactNative: RN } = vendetta.metro.common;
         const h = React.createElement;
         const okComp = (c) => c && (typeof c === "function" || (typeof c === "object" && c.$$typeof));
         const NS = okComp(S.NativeSheet) ? S.NativeSheet : safe("hoja input", () => findByProps("ActionSheet")?.ActionSheet);
         const closeInput = () => safe("cerrar input", () => AS.hideActionSheet?.(INPUT_KEY));
-        const Input = () => {
-          const [text, setText] = React.useState(String(initial == null ? "" : initial));
-          // si la hoja se cierra de cualquier forma (tocar fuera, deslizar, atras) sin aceptar, cuenta como cancelar
+        const Form = () => {
+          const [text, setText] = React.useState(String((o.input && o.input.initial) == null ? "" : o.input.initial));
+          // si la hoja se cierra de cualquier forma (tocar fuera, deslizar, atras) sin elegir, cuenta como cancelar
           React.useEffect(() => () => finish(null), []);
-          const ok = () => { finish(String(text).trim()); closeInput(); };
-          const cancel = () => { finish(null); closeInput(); };
-          const btn = (label, color, onPress) =>
-            h(RN.Pressable, { onPress, style: { flex: 1, height: 44, borderRadius: 8, alignItems: "center", justifyContent: "center", backgroundColor: color } },
-              h(RN.Text, { style: { color: "#fff", fontWeight: "bold", fontSize: 15 } }, label));
-          const body = h(RN.View, { style: { padding: 16, paddingBottom: 24 } },
-            h(RN.Text, { style: { color: "#fff", fontSize: 18, fontWeight: "bold", marginBottom: 12 } }, String(title || "")),
-            h(RN.TextInput, {
-              value: text, onChangeText: setText, placeholder: placeholder || "", placeholderTextColor: "#80848e",
-              autoFocus: true, autoCorrect: false, autoCapitalize: "none", returnKeyType: "done", onSubmitEditing: ok,
-              style: { backgroundColor: "#2b2d31", color: "#fff", borderRadius: 8, paddingHorizontal: 12, height: 44, marginBottom: 12 },
-            }),
-            h(RN.View, { style: { flexDirection: "row", gap: 8 } }, btn("Cancelar", "#4e5058", cancel), btn("Aceptar", "#5865f2", ok)));
+          const act = (a) => {
+            if (a.value == null) finish(null); else finish({ value: a.value, text: String(text).trim() });
+            closeInput();
+          };
+          const submitAct = o.actions.find((a) => a.value != null && a.value === o.submit);
+          const btn = (a) =>
+            h(RN.Pressable, { key: a.label, onPress: () => act(a), style: { flex: 1, height: 44, borderRadius: 8, alignItems: "center", justifyContent: "center", backgroundColor: a.color } },
+              h(RN.Text, { style: { color: "#fff", fontWeight: "bold", fontSize: 15 } }, a.label));
+          const kids = [h(RN.Text, { key: "t", style: { color: "#fff", fontSize: 18, fontWeight: "bold", marginBottom: o.info ? 4 : 12 } }, String(o.title || ""))];
+          if (o.info) kids.push(h(RN.Text, { key: "i", style: { color: "#b5bac1", fontSize: 13, marginBottom: 12 } }, String(o.info)));
+          if (o.input) kids.push(h(RN.TextInput, {
+            key: "in", value: text, onChangeText: setText, placeholder: o.input.placeholder || "", placeholderTextColor: "#80848e",
+            autoFocus: true, autoCorrect: false, autoCapitalize: "none", returnKeyType: "done", onSubmitEditing: () => submitAct && act(submitAct),
+            style: { backgroundColor: "#2b2d31", color: "#fff", borderRadius: 8, paddingHorizontal: 12, height: 44, marginBottom: 12 },
+          }));
+          kids.push(h(RN.View, { key: "b", style: { flexDirection: "row", gap: 8 } }, ...o.actions.map(btn)));
+          const body = h(RN.View, { style: { padding: 16, paddingBottom: 24 } }, ...kids);
           return NS ? h(NS, null, body) : h(RN.View, { style: { backgroundColor: "#1e1f22", borderTopLeftRadius: 16, borderTopRightRadius: 16 } }, body);
         };
         const comp = () => {
           const B = getBoundary(React, RN);
-          return B ? h(B, null, h(Input)) : h(Input);
+          return B ? h(B, null, h(Form)) : h(Form);
         };
         AS.openLazy(Promise.resolve({ default: comp }), INPUT_KEY, {});
       } catch (e) {
-        console.error(TAG, "cuadro de texto fallo:", e);
-        finish(initial);
+        console.error(TAG, "hoja de texto fallo:", e);
+        finish(undefined);
       }
     });
+  }
+  const CANCEL_BTN = { label: "Cancelar", color: "#4e5058", value: null };
+  async function askText(title, initial, placeholder) {
+    const r = await sheetPrompt({
+      title, input: { initial, placeholder }, submit: "ok",
+      actions: [CANCEL_BTN, { label: "Aceptar", color: "#5865f2", value: "ok" }],
+    });
+    if (r === undefined) return initial; // sin hoja: se usa el valor propuesto
+    return r ? r.text : null;
+  }
+  // Formulario de importar: datos de la imagen + nombre (si es una sola) + Sticker / Emoji, todo en una hoja.
+  // o: { title, info, name } (name = null: sin campo de nombre). Devuelve { kind, name } o null.
+  async function askImport(o) {
+    const r = await sheetPrompt({
+      title: o.title, info: o.info, input: o.name == null ? null : { initial: o.name, placeholder: "nombre" }, submit: "sticker",
+      actions: [CANCEL_BTN, { label: "Emoji", color: "#248046", value: "emoji" }, { label: "Sticker", color: "#5865f2", value: "sticker" }],
+    });
+    if (r === undefined) { // sin hoja: dialogo nativo de respaldo
+      const k = await choose(o.title, o.info, ["Sticker", "Emoji"]);
+      return k < 0 ? null : { kind: k === 0 ? "sticker" : "emoji", name: o.name };
+    }
+    return r ? { kind: r.value, name: r.text } : null;
   }
   const hasTextInput = () => typeof S.ActionSheet?.openLazy === "function";
 
   // ---------- Flujo de importar ----------
   let importBusy = 0;
+  // Huella rapida (largo + muestra de bytes) para avisar si la misma imagen ya se importo antes
+  function bytesSig(b) {
+    const n = b.length, step = Math.max(1, Math.floor(n / 4096));
+    let hsh = 2166136261 >>> 0;
+    for (let i = 0; i < n; i += step) hsh = Math.imul(hsh ^ b[i], 16777619) >>> 0;
+    return n + ":" + hsh.toString(36);
+  }
+  // Nombre que no se repite entre los importados del mismo tipo ("gato", "gato 2", "gato 3"...)
+  function uniqueName(base, kind) {
+    const taken = new Set(libItems().filter((x) => x.kind === kind).map((x) => norm(x.name)));
+    if (!taken.has(norm(base))) return base;
+    for (let n = 2; n < 1000; n++) {
+      const c = base.slice(0, 28) + " " + n;
+      if (!taken.has(norm(c))) return c;
+    }
+    return base;
+  }
+  const describeImg = (r) =>
+    r.type.toUpperCase() + (r.qi.w ? " " + r.qi.w + "x" + r.qi.h : "") + (r.qi.animated && r.type !== "gif" ? " animado" : "") +
+    " | " + Math.max(1, Math.round(r.bytes.length / 1024)) + " KB" +
+    (r.type === "webp" ? "\nNo se puede achicar: se manda con su tamano original" : "");
+
+  // source: "link" para importar desde un link; cualquier otra cosa abre directo el selector de archivos
   async function startImport(source) {
     if (importBusy && Date.now() - importBusy < 90000) { toast("Ya hay una importacion en curso"); return; }
     importBusy = Date.now();
     try {
-      let src = source;
-      if (!src) {
-        const c = await choose("Importar imagen", "PNG, GIF, APNG, WebP o JPG, como sticker o emoji", ["Galeria", "Link"]);
-        if (c < 0) return;
-        src = c === 0 ? "gallery" : "link";
-      }
-      let bytes, fname;
+      let src = source === "link" ? "link" : "gallery";
+      const srcs = []; // { bytes, fname }
+      let bad = 0, why = "";
       if (src === "gallery") {
-        let f, deep = false;
-        for (;;) {
-          try { f = await pickFromGallery(deep); break; }
-          catch (e) {
-            if (!e.noPicker) throw e;
-            const canDeep = !deep && !deepScanBad();
-            const c = await choose("Sin selector de galeria",
-              canDeep
-                ? "No encontre un selector de galeria ya cargado en Discord. Puedo buscar a fondo (si la app se cierra, esta busqueda se desactiva sola) o importar desde un link."
-                : "Esta version de Discord no permite abrir la galeria desde el plugin. ¿Importar desde un link?",
-              canDeep ? ["Buscar a fondo", "Desde un link"] : ["Desde un link"]);
-            if (c < 0) return;
-            if (canDeep && c === 0) { deep = true; continue; }
-            src = "link";
-            break;
-          }
+        let picked = null;
+        try { picked = await pickFromGallery(); }
+        catch (e) {
+          if (!e.noPicker) throw e;
+          const c = await choose("Sin selector de galeria", "Esta version de Discord no permite abrir la galeria desde el plugin. ¿Importar desde un link?", ["Desde un link"]);
+          if (c !== 0) return;
+          src = "link";
         }
         if (src === "gallery") {
-          if (!f) return; // cancelado
-          toast("Leyendo archivo...");
-          bytes = await readLocalBytes(f.uri);
-          fname = f.name;
+          if (!picked || !picked.length) return; // cancelado
+          toast(picked.length > 1 ? "Leyendo " + picked.length + " archivos..." : "Leyendo archivo...");
+          for (const f of picked) {
+            try { srcs.push({ bytes: await readLocalBytes(f.uri), fname: f.name }); }
+            catch (e) { bad++; why = String((e && e.message) || e); }
+          }
         }
       }
       if (src === "link") {
@@ -1979,27 +2042,54 @@
         url = String(url).trim();
         if (!/^https?:\/\/\S+$/i.test(url)) { toast(hasTextInput() ? "Ese no es un link valido" : "Copia primero el link de la imagen y vuelve a tocar Importar"); return; }
         toast("Descargando...");
-        bytes = await xhrGetBytes(url);
-        fname = url;
+        srcs.push({ bytes: await xhrGetBytes(url), fname: url });
       }
-      if (bytes.length > LIB_MAX_SRC) throw new Error("el archivo pesa mas de " + Math.round(LIB_MAX_SRC / 1048576) + " MB");
-      const type = sniffImage(bytes);
-      if (!type) throw new Error("no es una imagen PNG, GIF, WebP o JPG");
-      const qi = quickInfo(bytes, type);
-      const desc = type.toUpperCase() + (qi.w ? " " + qi.w + "x" + qi.h : "") + (qi.animated && type !== "gif" ? " animado" : "") + " | " + Math.max(1, Math.round(bytes.length / 1024)) + " KB" +
-        (type === "webp" ? "\nNo se puede achicar: se manda con su tamano original" : "");
-      const k = await choose("Importar como...", desc, ["Sticker", "Emoji"]);
-      if (k < 0) return;
-      const kind = k === 0 ? "sticker" : "emoji";
-      const nm = await askText("Nombre", cleanName(fname), "nombre");
-      if (nm == null) return;
-      toast("Procesando...");
-      const rec = await buildLibItem(bytes, nm || fname, kind);
-      await addToLib(rec);
-      importState.ok++;
-      importState.last = "ok " + kind + " " + rec.ext + " " + rec.w + "x" + rec.h + " " + rec.bytes + " bytes";
-      toast("Importado como " + kind + (rec.animated ? " animado" : "") + ": " + rec.name);
-      refreshCatalog();
+
+      // Revisar cada archivo antes de preguntar nada
+      const ready = [];
+      for (const sc of srcs) {
+        if (sc.bytes.length > LIB_MAX_SRC) { bad++; why = "el archivo pesa mas de " + Math.round(LIB_MAX_SRC / 1048576) + " MB"; continue; }
+        const type = sniffImage(sc.bytes);
+        if (!type) { bad++; why = "no es una imagen PNG, GIF, WebP o JPG"; continue; }
+        ready.push({ bytes: sc.bytes, fname: sc.fname, type, qi: quickInfo(sc.bytes, type) });
+      }
+      if (!ready.length) throw new Error(why || "no se pudo leer ninguna imagen");
+
+      // Una sola hoja: datos + nombre + Sticker / Emoji
+      const one = ready.length === 1;
+      const ans = await askImport({
+        title: one ? "Importar imagen" : "Importar " + ready.length + " imagenes",
+        info: one ? describeImg(ready[0]) : ready.length + " imagenes" + (bad ? " (" + bad + " no se pudieron leer)" : "") + "\nSe usa el nombre de cada archivo",
+        name: one ? cleanName(ready[0].fname) : null,
+      });
+      if (!ans) return;
+      const kind = ans.kind;
+
+      await ensureLib();
+      let ok = 0, dup = 0, fail = bad, lastErr = why, lastRec = null;
+      for (let i = 0; i < ready.length; i++) {
+        const r = ready[i];
+        try {
+          const sig = bytesSig(r.bytes);
+          if (libItems().some((x) => x.sig === sig && x.kind === kind)) { dup++; continue; }
+          toast(one ? "Procesando..." : "Procesando " + (i + 1) + "/" + ready.length + "...");
+          const nm = uniqueName(cleanName((one && ans.name) || r.fname), kind);
+          const rec = await buildLibItem(r.bytes, nm, kind);
+          rec.sig = sig;
+          await addToLib(rec);
+          ok++; importState.ok++; lastRec = rec;
+        } catch (e) {
+          fail++; importState.fail++;
+          lastErr = String((e && e.message) || e);
+        }
+      }
+      if (lastRec) importState.last = "ok " + ok + " " + kind + " | ultimo " + lastRec.ext + " " + lastRec.w + "x" + lastRec.h + " " + lastRec.bytes + " bytes";
+      else if (fail) importState.last = "fallo: " + lastErr;
+      if (ok) refreshCatalog();
+      if (ok === 1 && ready.length === 1 && !fail) toast("Importado como " + kind + (lastRec.animated ? " animado" : "") + ": " + lastRec.name);
+      else if (!ok && dup && !fail) toast(one ? "Ya la habias importado como " + kind : "Todas ya estaban importadas como " + kind);
+      else if (!ok) toast("No se pudo importar: " + lastErr.slice(0, 100));
+      else toast("Importadas " + ok + " como " + kind + (dup ? " | repetidas: " + dup : "") + (fail ? " | fallaron: " + fail + (lastErr ? " (" + lastErr.slice(0, 50) + ")" : "") : ""));
     } catch (e) {
       importState.fail++;
       importState.last = "fallo: " + String((e && e.message) || e);
@@ -2553,7 +2643,7 @@
         h(FormRow, { label: "Abrir selector de stickers", subLabel: "Tambien: escribe /sticker en el chat", onPress: () => openPicker({ tab: "sticker" }) }),
         h(FormRow, { label: "Abrir selector de emojis", subLabel: "Tambien: escribe /emoji en el chat", onPress: () => openPicker({ tab: "emoji" }) })),
       h(FormSection, { title: "Importados" },
-        h(FormRow, { label: "Importar de la galeria", subLabel: "PNG, GIF, APNG, WebP o JPG, como sticker o emoji (animados tambien)", onPress: () => startImport("gallery") }),
+        h(FormRow, { label: "Importar de la galeria", subLabel: "Abre el selector de archivos; puedes elegir varias (PNG, GIF, APNG, WebP o JPG)", onPress: () => startImport("gallery") }),
         h(FormRow, { label: "Importar desde un link", subLabel: "Copia el link de una imagen y toca aqui", onPress: () => startImport("link") }),
         getList("pickBad").length || deepScanBad() ? h(FormRow, {
           label: "Selectores de galeria descartados",
