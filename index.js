@@ -1345,26 +1345,84 @@
   }
 
   // ---------- Elegir el archivo ----------
-  // Discord no trae un selector propio documentado: se prueban los que suelen venir incluidos y se usa el primero que exista.
-  const PICK_FNS = ["launchImageLibraryAsync", "launchImageLibrary", "getDocumentAsync", "pickSingle", "pick", "openPicker"];
-  function findPickers() {
-    const out = [], seen = new Set();
-    const add = (label, mod, fn) => {
-      if (mod && (typeof mod === "object" || typeof mod === "function") && typeof mod[fn] === "function" && !seen.has(mod[fn])) { seen.add(mod[fn]); out.push({ label, mod, fn }); }
-    };
-    add("expo-image-picker", safe("p1", () => findByProps("launchImageLibraryAsync")), "launchImageLibraryAsync");
-    add("react-native-image-picker", safe("p2", () => findByProps("launchImageLibrary")), "launchImageLibrary");
-    add("expo-document-picker", safe("p3", () => findByProps("getDocumentAsync")), "getDocumentAsync");
-    add("document-picker", safe("p4", () => findByProps("pickSingle")), "pickSingle");
-    add("document-picker", safe("p5", () => findByProps("pick", "isCancel")), "pick");
-    // Los modulos nativos desconocidos ya NO se llaman a ciegas (un argumento equivocado cierra la app).
-    // Si la app se cerro justo al abrir un selector, ese selector se descarta para siempre (hasta que lo restablezcas).
+  // Discord no trae un selector propio documentado: se usa el primero que exista entre los que suelen venir incluidos.
+  // IMPORTANTE (arreglo del cierre de la app al elegir "Galeria"):
+  //  1) Antes se buscaba con findByProps, y cuando el nombre no existe eso obliga a Discord a inicializar TODOS sus
+  //     modulos de golpe (puede congelar o cerrar la app). Ahora solo se miran los modulos que YA estan cargados.
+  //     La busqueda a fondo (la de antes) queda como paso opcional, y si cierra la app se desactiva sola.
+  //  2) Antes de entrar al codigo nativo se guarda un marcador y se espera un instante a que se escriba en disco;
+  //     asi, si la app se cierra, al volver se sabe cual selector fue y se descarta (antes el marcador podia perderse).
+  //  3) Se prueban primero los selectores mas simples y estandar; el de Expo (el mas delicado) va al final.
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const PICK_SPECS = [
+    { label: "react-native-image-picker", fn: "launchImageLibrary", props: ["launchImageLibrary"] },
+    { label: "document-picker", fn: "pickSingle", props: ["pickSingle"] },
+    { label: "document-picker", fn: "pick", props: ["pick", "isCancel"] },
+    { label: "expo-document-picker", fn: "getDocumentAsync", props: ["getDocumentAsync"] },
+    { label: "expo-image-picker", fn: "launchImageLibraryAsync", props: ["launchImageLibraryAsync"] },
+  ];
+  // Si la app se cerro justo durante un paso riesgoso, ese paso se descarta (hasta que lo restablezcas en Ajustes)
+  function settlePickCrash() {
     safe("descartar", () => {
-      const pend = vendetta.plugin.storage.pickPending;
+      const st = vendetta.plugin.storage;
+      const pend = st.pickPending;
       if (pend) { setList("pickBad", [...new Set([...getList("pickBad"), pend])]); setList("pickPending", ""); }
+      if (st.scanPending) { setList("scanBad", true); setList("scanPending", ""); }
     });
+  }
+  const deepScanBad = () => { try { return !!vendetta.plugin.storage.scanBad; } catch (_) { return false; } };
+  // Solo modulos ya inicializados (no fuerza ninguno): devuelve Map spec -> modulo
+  function scanLoadedPickers() {
+    const found = new Map();
+    const mods = vendetta.metro.modules ?? globalThis.modules ?? {};
+    for (const id in mods) {
+      try {
+        const m = mods[id];
+        if (!m || m.isInitialized === false) continue;
+        const exp = m.publicModule?.exports;
+        if (!exp) continue;
+        for (const holder of [exp, exp.default]) {
+          if (!holder || (typeof holder !== "object" && typeof holder !== "function")) continue;
+          for (const sp of PICK_SPECS) {
+            if (found.has(sp)) continue;
+            let ok = true;
+            for (const pr of sp.props) { if (typeof holder[pr] !== "function") { ok = false; break; } }
+            if (ok) found.set(sp, holder);
+          }
+        }
+      } catch (_) {}
+      if (found.size === PICK_SPECS.length) break;
+    }
+    return found;
+  }
+  // deep = true: ademas busca con findByProps (inicializa modulos; solo se usa con el marcador de seguridad puesto)
+  function collectPickers(deep) {
+    const out = [], seen = new Set();
+    const add = (sp, mod) => {
+      const f = mod && (typeof mod === "object" || typeof mod === "function") ? safe("fn", () => mod[sp.fn]) : null;
+      if (typeof f === "function" && !seen.has(f)) { seen.add(f); out.push({ label: sp.label, mod, fn: sp.fn }); }
+    };
+    const loaded = safe("escaneo", scanLoadedPickers) || new Map();
+    for (const sp of PICK_SPECS) {
+      let mod = loaded.get(sp);
+      if (!mod && deep) mod = safe("busqueda " + sp.label, () => findByProps(...sp.props));
+      add(sp, mod);
+    }
+    // Los modulos nativos desconocidos ya NO se llaman a ciegas (un argumento equivocado cierra la app).
     const bad = getList("pickBad");
     return out.filter((c) => !bad.includes(c.label + "." + c.fn));
+  }
+  const findPickers = () => { settlePickCrash(); return collectPickers(false); };
+  // Busqueda a fondo (opcional): con marcador guardado antes; si la app se cierra aqui, no se vuelve a ofrecer
+  async function deepFindPickers() {
+    settlePickCrash(); // primero se resuelve lo de la vez anterior; despues se pone el marcador nuevo
+    if (deepScanBad()) return [];
+    toast("Buscando selector... si la app se cierra, esta busqueda se desactiva sola");
+    setList("scanPending", "1");
+    await sleep(400); // tiempo para que el marcador llegue al disco
+    let res = [];
+    try { res = collectPickers(true); } finally { setList("scanPending", ""); }
+    return res;
   }
   function pickerScan() { // nombres con pinta de selector de galeria, para el reporte
     const names = new Set();
@@ -1414,14 +1472,15 @@
     const u = String(uri);
     return { uri: /^[a-z]+:\/\//i.test(u) ? u : "file://" + u, name: a.fileName || a.name || u.split("/").pop(), mime: a.mimeType || a.type };
   }
-  async function pickFromGallery() {
-    const cands = findPickers();
+  async function pickFromGallery(deep) {
+    const cands = deep ? await deepFindPickers() : findPickers();
     importState.pickers = cands.map((c) => c.label + "." + c.fn).join(", ") || "ninguno";
     if (!cands.length) { const e = new Error("esta version de Discord no expone un selector de galeria"); e.noPicker = true; throw e; }
     let lastErr = null;
     for (const c of cands) {
       try {
         setList("pickPending", c.label + "." + c.fn); // si la app se cierra aqui, al volver se descarta este selector
+        await sleep(350); // da tiempo a que el marcador se escriba antes de entrar al codigo nativo
         let res;
         try { res = await callPicker(c); } finally { setList("pickPending", ""); }
         const f = pickedFile(res);
@@ -1495,13 +1554,22 @@
       }
       let bytes, fname;
       if (src === "gallery") {
-        let f;
-        try { f = await pickFromGallery(); }
-        catch (e) {
-          if (!e.noPicker) throw e;
-          const c = await choose("Sin selector de galeria", "Esta version de Discord no permite abrir la galeria desde el plugin. ¿Importar desde un link?", ["Desde un link"]);
-          if (c < 0) return;
-          src = "link";
+        let f, deep = false;
+        for (;;) {
+          try { f = await pickFromGallery(deep); break; }
+          catch (e) {
+            if (!e.noPicker) throw e;
+            const canDeep = !deep && !deepScanBad();
+            const c = await choose("Sin selector de galeria",
+              canDeep
+                ? "No encontre un selector de galeria ya cargado en Discord. Puedo buscar a fondo (si la app se cierra, esta busqueda se desactiva sola) o importar desde un link."
+                : "Esta version de Discord no permite abrir la galeria desde el plugin. ¿Importar desde un link?",
+              canDeep ? ["Buscar a fondo", "Desde un link"] : ["Desde un link"]);
+            if (c < 0) return;
+            if (canDeep && c === 0) { deep = true; continue; }
+            src = "link";
+            break;
+          }
         }
         if (src === "gallery") {
           if (!f) return; // cancelado
@@ -2035,7 +2103,7 @@
   function reportText() {
     const r = state.report;
     return (
-      "StickerSender v2.9\n" +
+      "StickerSender v2.10\n" +
       "parcheados: " + (r.patched.join(", ") || "ninguno") + "\n" +
       "no encontrados: " + (r.missing.join(", ") || "ninguno") + "\n" +
       "nombres parecidos: " + (r.similar.slice(0, 60).join(", ") || "ninguno") + "\n" +
@@ -2053,7 +2121,7 @@
       "ultimo error del selector: " + (state.pickerError || "ninguno") + "\n" +
       "importados: " + libItems().length + " (" + (lib.mode || "sin abrir") + (lib.err ? ", error: " + lib.err : "") + ") | ok: " + importState.ok + " fallos: " + importState.fail + " enviados: " + importState.sent + "\n" +
       "ultimo importar: " + (importState.last || "ninguno") + " | selectores usados: " + (importState.pickers || "sin probar") + "\n" +
-      "selectores descartados por cerrar la app: " + (getList("pickBad").join(", ") || "ninguno") + "\n" +
+      "selectores descartados por cerrar la app: " + (getList("pickBad").join(", ") || "ninguno") + " | busqueda a fondo descartada: " + deepScanBad() + "\n" +
       "selectores de galeria disponibles: " +(safe("find", () => findPickers().map((c) => c.label + "." + c.fn).join(", ")) || "ninguno") + "\n" +
       "nombres de selector en modulos: " + (safe("scan", () => { const s = pickerScan(); return (s.names.join(", ") || "ninguno") + " | nativos: " + (s.native.join(", ") || "ninguno"); }) ?? "error") + "\n" +
       "storage: createStorage:" + (typeof vendetta.storage?.createStorage) + " createFileBackend:" + (typeof vendetta.storage?.createFileBackend) + " showInputAlert:" + (typeof vendetta.ui?.alerts?.showInputAlert) + "\n" +
@@ -2095,10 +2163,10 @@
       h(FormSection, { title: "Importados" },
         h(FormRow, { label: "Importar de la galeria", subLabel: "PNG, GIF, APNG, WebP o JPG, como sticker o emoji (animados tambien)", onPress: () => startImport("gallery") }),
         h(FormRow, { label: "Importar desde un link", subLabel: "Copia el link de una imagen y toca aqui", onPress: () => startImport("link") }),
-        getList("pickBad").length ? h(FormRow, {
+        getList("pickBad").length || deepScanBad() ? h(FormRow, {
           label: "Selectores de galeria descartados",
-          subLabel: getList("pickBad").join(", ") + " (cerraron la app; toca para volver a probarlos)",
-          onPress: () => { setList("pickBad", []); force(); toast("Se volveran a probar"); },
+          subLabel: [...getList("pickBad"), deepScanBad() ? "busqueda a fondo" : null].filter(Boolean).join(", ") + " (cerraron la app; toca para volver a probarlos)",
+          onPress: () => { setList("pickBad", []); setList("scanBad", false); setList("pickPending", ""); setList("scanPending", ""); force(); toast("Se volveran a probar"); },
         }) : null,
         ...libItems().map((it) =>
           h(FormRow, {
@@ -2199,6 +2267,7 @@
         }
         timers.push(setTimeout(() => safe("precarga", () => getCatalog()), 4000));
       });
+      safe("selectores", settlePickCrash); // si la app se cerro en un paso de la galeria, se descarta ese paso
       safe("biblioteca", () => { ensureLib(); }); // abre la biblioteca de importados (en segundo plano)
 
       // 0) Comandos: /sticker [nombre] y /emoji
