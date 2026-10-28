@@ -1656,8 +1656,12 @@
   async function renderLocal(it) {
     const data = b64decode(it.b64);
     if (it.raw) return { bytes: data, ext: it.ext, mime: it.mime };
+    return padImageBytes(data, it.ext);
+  }
+  // PNG estatico o GIF -> mismo lienzo transparente con margen que usan todos los stickers (tamano de sticker, no gigante)
+  async function padImageBytes(data, ext) {
     let anim;
-    if (it.ext === "gif") anim = await decodeGif(data, 4096, 120);
+    if (ext === "gif") anim = await decodeGif(data, 4096, 120);
     else { const p = parsePngStatic(data); anim = { w: p.w, h: p.h, frames: [{ rgba: p.rgba, cs: 10 }] }; }
     const k = gifPad();
     if (k > 1) { // el lienzo mide lo mismo para todos (tamano de sticker x margen): asi cada uno conserva su proporcion
@@ -1721,7 +1725,11 @@
       const bytes = await xhrGetBytes(url);
       const type = sniffImage(bytes);
       if (!type) throw new Error("no es una imagen");
-      await uploadGif(channelId, bytes, fileSafe(name || (st && st.name)) + "." + type, text, "image/" + (type === "jpg" ? "jpeg" : type));
+      // Mismo tamano de sticker que el resto: lienzo transparente con margen (si no, Discord lo agranda al ancho del chat).
+      // Lo que no se puede pasar por ahi (APNG animado sin conversion a GIF, WebP, JPG) se manda como link, como antes.
+      if (!(type === "gif" || (type === "png" && !quickInfo(bytes, type).animated))) { sendContent(channelId, (text ? text + "\n" : "") + url); return; }
+      const out = await padImageBytes(bytes, type);
+      await uploadGif(channelId, out.bytes, fileSafe(name || (st && st.name)) + "." + out.ext, text, out.mime);
     } catch (e) {
       fallback(String((e && e.message) || e));
     } finally {
