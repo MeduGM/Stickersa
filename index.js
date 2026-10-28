@@ -18,6 +18,7 @@
     scrollMode: "gh",       // lista del selector: gh (gestos nativos) | rn (normal) | sheet (la hoja se desliza)
     nativeSheet: true,      // selector dentro del ActionSheet nativo (cierra bien). Apagar = modo de respaldo
     keepOpen: false,        // dejar el selector abierto despues de mandar (para mandar varios)
+    preMessage: true,       // al elegir un sticker, abrir un pre-mensaje (vista previa + texto opcional) antes de mandarlo
     nativeUnlock: true,     // intentar desbloquear los selectores nativos de Discord
     debugReport: false,     // copiar reporte al portapapeles en cada inicio
   };
@@ -1668,7 +1669,7 @@
       : { bytes: pngEncode(anim.w, anim.h, anim.frames[0].rgba), ext: "png", mime: "image/png" };
   }
   const localCache = new Map(); // id|tamano|margen -> {bytes, ext, mime} (ultimos 8, 6 MB)
-  async function sendLocalItem(channelId, item) {
+  async function sendLocalItem(channelId, item, text) {
     if (!channelId) channelId = S.SelectedChannelStore?.getChannelId?.();
     if (!channelId) { toast("No hay canal abierto"); return; }
     const it = item.lib, bk = channelId + ":" + item.key;
@@ -1691,7 +1692,7 @@
           localCache.delete(k);
         }
       }
-      await uploadGif(channelId, r.bytes, fileSafe(it.name) + "." + r.ext, "", r.mime);
+      await uploadGif(channelId, r.bytes, fileSafe(it.name) + "." + r.ext, text || "", r.mime);
       importState.sent++;
     } catch (e) {
       importState.fail++;
@@ -1937,11 +1938,12 @@
           const btn = (a) =>
             h(RN.Pressable, { key: a.label, onPress: () => act(a), style: { flex: 1, height: 44, borderRadius: 8, alignItems: "center", justifyContent: "center", backgroundColor: a.color } },
               h(RN.Text, { style: { color: "#fff", fontWeight: "bold", fontSize: 15 } }, a.label));
-          const kids = [h(RN.Text, { key: "t", style: { color: "#fff", fontSize: 18, fontWeight: "bold", marginBottom: o.info ? 4 : 12 } }, String(o.title || ""))];
+          const kids = o.preview ? [h(RN.Image, { key: "pv", source: { uri: o.preview }, resizeMode: "contain", style: { width: 96, height: 96, alignSelf: "center", marginBottom: 8 } })] : [];
+          kids.push(h(RN.Text, { key: "t", style: { color: "#fff", fontSize: 18, fontWeight: "bold", marginBottom: o.info ? 4 : 12, textAlign: o.preview ? "center" : "left" } }, String(o.title || "")));
           if (o.info) kids.push(h(RN.Text, { key: "i", style: { color: "#b5bac1", fontSize: 13, marginBottom: 12 } }, String(o.info)));
           if (o.input) kids.push(h(RN.TextInput, {
             key: "in", value: text, onChangeText: setText, placeholder: o.input.placeholder || "", placeholderTextColor: "#80848e",
-            autoFocus: true, autoCorrect: false, autoCapitalize: "none", returnKeyType: "done", onSubmitEditing: () => submitAct && act(submitAct),
+            autoFocus: o.input.autoFocus !== false, autoCorrect: !!o.input.plain, autoCapitalize: o.input.plain ? "sentences" : "none", returnKeyType: o.input.plain ? "send" : "done", onSubmitEditing: () => submitAct && act(submitAct),
             style: { backgroundColor: "#2b2d31", color: "#fff", borderRadius: 8, paddingHorizontal: 12, height: 44, marginBottom: 12 },
           }));
           kids.push(h(RN.View, { key: "b", style: { flexDirection: "row", gap: 8 } }, ...o.actions.map(btn)));
@@ -2222,14 +2224,16 @@
   }
 
   let lastPick = { key: "", at: 0 };
-  function pickItem(item, channelId) {
+  // text (opcional): mensaje que acompana al sticker
+  function pickItem(item, channelId, text) {
     const now = Date.now();
     if (lastPick.key === item.key && now - lastPick.at < 700) return; // doble toque
+    text = String(text || "").trim();
     if (item.local) { // importado de la galeria: se manda como archivo
       lastPick = { key: item.key, at: now };
       if (!cfg("keepOpen")) closePicker();
       pushRecent(item.key);
-      sendLocalItem(channelId, item);
+      sendLocalItem(channelId, item, text);
       return;
     }
     const url = item.kind === "sticker" ? stickerUrl(item.raw) : emojiUrl(item.id, item.animated);
@@ -2237,8 +2241,31 @@
     lastPick = { key: item.key, at: now };
     if (!cfg("keepOpen")) closePicker();
     pushRecent(item.key);
-    if (item.kind === "sticker" && wantGif(item.raw)) { sendApngGif(channelId, item.raw, "", url); return; }
-    sendContent(channelId, url);
+    if (item.kind === "sticker" && wantGif(item.raw)) { sendApngGif(channelId, item.raw, text, url); return; }
+    sendContent(channelId, (text ? text + "\n" : "") + url);
+  }
+
+  // PRE-MENSAJE: al tocar un sticker no se manda de una; se abre una hoja con su vista previa y un campo de texto.
+  // "Enviar" lo manda junto con el texto (vacio = solo el sticker). "Cancelar" vuelve al selector sin mandar nada.
+  let composing = 0;
+  async function stagePick(item, channelId) {
+    if (item.kind !== "sticker" || cfg("preMessage") === false || !hasTextInput()) return pickItem(item, channelId); // emojis y modo directo: como antes
+    if (composing && Date.now() - composing < 120000) return;
+    composing = Date.now();
+    try {
+      const okUrl = item.local || (item.raw && stickerUrl(item.raw));
+      if (!okUrl) { toast("Ese sticker no se puede mandar como imagen"); return; }
+      const r = await sheetPrompt({
+        title: item.name, preview: previewUrl(item),
+        input: { initial: "", placeholder: "Mensaje (opcional)", plain: true }, submit: "send",
+        actions: [CANCEL_BTN, { label: "Enviar", color: "#5865f2", value: "send" }],
+      });
+      if (r === undefined) return pickItem(item, channelId); // sin hoja disponible: se manda directo como antes
+      if (!r) return; // cancelado o cerrado: no se manda nada
+      pickItem(item, channelId, r.text);
+    } finally {
+      composing = 0;
+    }
   }
 
   // ---------- Envio nativo de stickers (cualquier funcion sendSticker*) ----------
@@ -2278,7 +2305,7 @@
     CellC = React.memo(function Cell(p) {
       const item = p.item;
       return h(RN.Pressable, {
-        onPress: () => pickItem(item, p.channelId),
+        onPress: () => stagePick(item, p.channelId),
         onLongPress: () => { toast(toggleFav(item.key) ? "Agregado a favoritos" : "Quitado de favoritos"); p.bump(); },
         style: { width: 100 / p.cols + "%", alignItems: "center", padding: 4 },
       },
@@ -2693,6 +2720,7 @@
           subLabel: "Actual: " + cfg("scrollMode") + " (toca para cambiar: gh, sheet, rn). Si no baja, prueba otro",
           onPress: () => set("scrollMode", { gh: "sheet", sheet: "rn", rn: "gh" }[cfg("scrollMode")] || "gh"),
         }),
+        sw("preMessage", "Pre-mensaje al elegir sticker", "Muestra el sticker y te deja agregar texto antes de mandarlo"),
         sw("keepOpen", "Mantener selector abierto", "Para mandar varios seguidos"),
         sw("maskEmojiLinks", "Ocultar link de emoji", "Muestra [nombre] en vez del link"),
         sw("nativeUnlock", "Desbloquear selectores nativos", "Extra; requiere reiniciar el plugin"),
