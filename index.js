@@ -1703,6 +1703,32 @@
     }
   }
 
+  // Sticker normal + texto: se baja la imagen y se sube como archivo con el texto como mensaje.
+  // (Si se mandara el link junto al texto, Discord lo deja visible; solo lo oculta cuando el mensaje es unicamente el link.)
+  // Si algo falla, se manda el link como antes.
+  async function sendStickerWithText(channelId, st, url, text, name) {
+    if (!channelId) channelId = S.SelectedChannelStore?.getChannelId?.();
+    const fallback = (why) => {
+      console.warn(TAG, "sticker como archivo fallo:", why);
+      toast("No se pudo mandarlo como imagen (" + String(why).slice(0, 60) + "). Mando el link.");
+      sendContent(channelId, (text ? text + "\n" : "") + url);
+    };
+    if (!channelId) return fallback("sin canal");
+    const bk = channelId + ":txt:" + ((st && st.id) || url);
+    if (gifBusy.has(bk)) return; // toque repetido mientras se sube
+    gifBusy.add(bk);
+    try {
+      const bytes = await xhrGetBytes(url);
+      const type = sniffImage(bytes);
+      if (!type) throw new Error("no es una imagen");
+      await uploadGif(channelId, bytes, fileSafe(name || (st && st.name)) + "." + type, text, "image/" + (type === "jpg" ? "jpeg" : type));
+    } catch (e) {
+      fallback(String((e && e.message) || e));
+    } finally {
+      gifBusy.delete(bk);
+    }
+  }
+
   // ---------- Elegir el archivo ----------
   // Discord no trae un selector propio documentado: se usa el primero que exista entre los que suelen venir incluidos.
   // IMPORTANTE (arreglo del cierre de la app al elegir "Galeria"):
@@ -2242,6 +2268,7 @@
     if (!cfg("keepOpen")) closePicker();
     pushRecent(item.key);
     if (item.kind === "sticker" && wantGif(item.raw)) { sendApngGif(channelId, item.raw, text, url); return; }
+    if (text && item.kind === "sticker") { sendStickerWithText(channelId, item.raw || item, url, text, item.name); return; }
     sendContent(channelId, (text ? text + "\n" : "") + url);
   }
 
@@ -2293,6 +2320,7 @@
       if (!urls.length) return orig(...args);
       const text = typeof args[2] === "string" ? args[2].trim() : "";
       if (urls.length === 1 && wantGif(sts[0])) { sendApngGif(channelId, sts[0], text, urls[0]); return; }
+      if (urls.length === 1 && text) { sendStickerWithText(channelId, sts[0], urls[0], text, sts[0] && sts[0].name); return; }
       return sendContent(channelId, (text ? text + "\n" : "") + urls.join("\n"));
     };
   }
